@@ -9,6 +9,7 @@ Telegram Bot API 9.4 `style` field ("primary" = blue, "success" = green, "danger
 import asyncio
 import html
 import io
+import itertools
 import logging
 import os
 import re
@@ -1339,7 +1340,7 @@ async def cb_account_select(call: CallbackQuery, state: FSMContext, bot: Bot):
     await safe_send(
         bot,
         call.from_user.id,
-        f"📤 Send your XLSX file.\n\n<i>{esc(PRODUCTS[code]['name'])} — Column A: Email, Column B: Password</i>",
+        f"📤 Send your XLSX file.\n\n<i>{esc(PRODUCTS[code]['name'])} — Column A: Email, Column B: Password (হেডার থাকা ঐচ্ছিক)</i>",
         reply_markup=cancel_flow_kb(),
     )
 
@@ -1361,13 +1362,18 @@ def parse_workbook(raw: bytes) -> dict:
     try:
         ws = wb.worksheets[0]
         rows = ws.iter_rows(min_row=1, max_col=2, values_only=True)
-        header = next(rows, None)
-        if header is None or len(header) < 2 or _norm(header[0]) != "email" or _norm(header[1]) != "password":
-            return {"error": "header"}
+        first = next(rows, None)
+        if first is None:
+            return {"error": "empty"}
+        # Header row is optional: skip it only if A1="Email" and B1="Password"
+        has_header = len(first) >= 2 and _norm(first[0]) == "email" and _norm(first[1]) == "password"
+        start = 2 if has_header else 1
+        if not has_header:
+            rows = itertools.chain([first], rows)
         total = 0
         valid, seen, dup, invalid = [], set(), 0, []
-        for line_no, row in enumerate(rows, start=2):
-            if line_no - 1 > MAX_XLSX_ROWS:
+        for line_no, row in enumerate(rows, start=start):
+            if line_no > MAX_XLSX_ROWS + 1:
                 return {"error": "too_many"}
             a = row[0] if len(row) > 0 else None
             b = row[1] if len(row) > 1 else None
@@ -1422,8 +1428,8 @@ async def admin_upload_file(message: Message, state: FSMContext, bot: Bot):
         await message.answer("❌ ফাইলটি পড়া যায়নি। বৈধ XLSX ফাইল পাঠান।")
         return
     if "error" in parsed:
-        if parsed["error"] == "header":
-            await message.answer("❌ প্রথম সারিতে কলাম A = Email এবং কলাম B = Password থাকতে হবে।")
+        if parsed["error"] == "empty":
+            await message.answer("❌ ফাইলটি খালি। কলাম A তে Email এবং কলাম B তে Password দিন।")
         else:
             await message.answer(f"❌ সর্বোচ্চ {MAX_XLSX_ROWS} সারি অনুমোদিত।")
         return
