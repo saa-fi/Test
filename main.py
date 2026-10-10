@@ -92,7 +92,7 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_XLSX_ROWS = 50000
 
 DHAKA = ZoneInfo("Asia/Dhaka")
-NAME_PREFIX = "ㅤ"  # decorative prefix from the spec's profile template; set to "" to remove
+NAME_PREFIX = "𝙎𝙖𝙁𝙞 -😌❤️‍🩹 "  # decorative prefix from the spec's profile template; set to "" to remove
 
 OFF_TEXT = "🔴 Bot turned off."
 
@@ -125,7 +125,7 @@ PRODUCTS = {
         "label": "𝐌𝐞𝐭𝐚 𝐇𝐨𝐫𝐢𝐳𝐨𝐧",
         "title": "Meta Horizon",
         "admin_label": "Meta Horizon",
-        "price": 60,
+        "price": 55,
     },
 }
 
@@ -333,7 +333,8 @@ def init_db() -> None:
     )
     for code, meta in PRODUCTS.items():
         db.execute(
-            "INSERT OR IGNORE INTO products (code, name, price, active) VALUES (?, ?, ?, 1)",
+            "INSERT INTO products (code, name, price, active) VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(code) DO UPDATE SET price=excluded.price",
             (code, meta["name"], meta["price"]),
         )
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_enabled', '1')")
