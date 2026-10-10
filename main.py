@@ -92,7 +92,7 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_XLSX_ROWS = 50000
 
 DHAKA = ZoneInfo("Asia/Dhaka")
-NAME_PREFIX = "𝙎𝙖𝙁𝙞 -😌❤️‍🩹 "  # decorative prefix from the spec's profile template; set to "" to remove
+NAME_PREFIX = " "  # decorative prefix from the spec's profile template; set to "" to remove
 
 OFF_TEXT = "🔴 Bot turned off."
 
