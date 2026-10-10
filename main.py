@@ -30,7 +30,7 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -92,9 +92,19 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_XLSX_ROWS = 50000
 
 DHAKA = ZoneInfo("Asia/Dhaka")
-NAME_PREFIX = "ㅤ"  # decorative prefix from the spec's profile template; set to "" to remove
+NAME_PREFIX = "𝙎𝙖𝙁𝙞 -😌❤️‍🩹 "  # decorative prefix from the spec's profile template; set to "" to remove
 
 OFF_TEXT = "🔴 Bot turned off."
+
+# bKash deposit switch: True = চালু, False = বন্ধ (শুধু bKash বন্ধ হবে, পুরো বট না)
+BKASH_ENABLED = False
+BKASH_OFF_TEXT = (
+    "🔴 bKash এখন বন্ধ আছে (Turned off)।\n"
+    "অনুগ্রহ করে Nagad অথবা Binance দিয়ে ডিপোজিট করুন।"
+)
+
+REFERRAL_BONUS = 70  # 0.70 BDT in poisha, per successful referral
+_bot_username: Optional[str] = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("quest_sell_bot")
@@ -129,6 +139,7 @@ METHODS = {
 BTN_BUY = "🛒 𝐁𝐮𝐲 𝐏𝐫𝐨𝐝𝐮𝐜𝐭𝐬"
 BTN_BAL = "💰 𝐁𝐚𝐥𝐚𝐧𝐜𝐞"
 BTN_DEP = "💳 𝐃𝐞𝐩𝐨𝐬𝐢𝐭"
+BTN_REF = "👥 𝐑𝐞𝐟𝐞𝐫𝐫𝐚𝐥𝐬"
 BTN_SUP = "📞 𝐒𝐮𝐩𝐩𝐨𝐫𝐭"
 
 WELCOME_TEXT = (
@@ -217,7 +228,7 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [kbtn(BTN_BUY, "primary")],
             [kbtn(BTN_BAL, "success"), kbtn(BTN_DEP, "success")],
-            [kbtn(BTN_SUP, "primary")],
+            [kbtn(BTN_REF, "success"), kbtn(BTN_SUP, "primary")],
         ],
         resize_keyboard=True,
     )
@@ -326,6 +337,9 @@ def init_db() -> None:
             (code, meta["name"], meta["price"]),
         )
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_enabled', '1')")
+    cols = [r["name"] for r in db.execute("PRAGMA table_info(users)").fetchall()]
+    if "referred_by" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
 
 
 # ---- settings ------------------------------------------------------------- #
@@ -343,7 +357,10 @@ def set_enabled(flag: bool) -> None:
 
 
 # ---- users ---------------------------------------------------------------- #
-def upsert_user(u: User) -> None:
+def upsert_user(u: User) -> bool:
+    """Insert/update a user. Returns True if this is the user's first time starting the bot."""
+    prev = db.execute("SELECT started FROM users WHERE user_id=?", (u.id,)).fetchone()
+    is_new = prev is None or not prev["started"]
     db.execute(
         "INSERT INTO users (user_id, username, full_name, balance, started, created_at) "
         "VALUES (?, ?, ?, 0, 1, ?) "
@@ -351,6 +368,7 @@ def upsert_user(u: User) -> None:
         "full_name=excluded.full_name, started=1",
         (u.id, u.username, u.full_name, now_iso()),
     )
+    return is_new
 
 
 def get_user(user_id: int):
@@ -371,6 +389,38 @@ def add_balance(user_id: int, amount: int) -> int:
         )
         db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
         return db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()["balance"]
+
+
+# ---- referrals ------------------------------------------------------------ #
+def register_referral(new_user_id: int, referrer_id: int) -> Optional[int]:
+    """Credit the referrer once for a brand-new user. Returns referrer's new balance or None."""
+    if new_user_id == referrer_id:
+        return None
+    with tx():
+        ref = db.execute(
+            "SELECT started FROM users WHERE user_id=?", (referrer_id,)
+        ).fetchone()
+        if ref is None or not ref["started"]:
+            return None
+        cur = db.execute(
+            "UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL",
+            (referrer_id, new_user_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        db.execute(
+            "UPDATE users SET balance = balance + ? WHERE user_id=?",
+            (REFERRAL_BONUS, referrer_id),
+        )
+        return db.execute(
+            "SELECT balance FROM users WHERE user_id=?", (referrer_id,)
+        ).fetchone()["balance"]
+
+
+def count_referrals(user_id: int) -> int:
+    return db.execute(
+        "SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user_id,)
+    ).fetchone()["c"]
 
 
 # ---- products / stock ----------------------------------------------------- #
@@ -709,7 +759,7 @@ class GateMiddleware(BaseMiddleware):
         if user is None or user.is_bot:
             return await handler(event, data)
 
-        upsert_user(user)
+        data["is_new_user"] = upsert_user(user)
 
         if is_enabled():
             return await handler(event, data)
@@ -753,9 +803,28 @@ def not_command(message: Message) -> bool:
 # Commands
 # --------------------------------------------------------------------------- #
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: CommandObject,
+                    is_new_user: bool = False):
     await state.clear()
     await message.answer(WELCOME_TEXT, reply_markup=main_menu())
+
+    # Referral: only for brand-new users opening a t.me/<bot>?start=ref_<id> link
+    m = re.fullmatch(r"ref_(\d{5,15})", (command.args or "").strip())
+    if not (m and is_new_user):
+        return
+    referrer_id = int(m.group(1))
+    new_balance = register_referral(message.from_user.id, referrer_id)
+    if new_balance is None:
+        return
+    name = esc(message.from_user.full_name)
+    await safe_send(
+        bot,
+        referrer_id,
+        "🎉 <b>নতুন রেফারেল!</b>\n\n"
+        f"👤 {name} আপনার লিংকে জয়েন করেছে।\n"
+        f"➕ বোনাস: {fmt_money(REFERRAL_BONUS)} TK\n"
+        f"👛 নতুন ব্যালেন্স: {fmt_money(new_balance)} TK",
+    )
 
 
 @router.message(Command("cancel"))
@@ -869,6 +938,25 @@ async def menu_deposit(message: Message, state: FSMContext):
         "💡 নোট: bKash, Nagad ডিপোজিট প্রতিদিন সকাল ০৯:০০ AM থেকে রাত ১১:০০ PM পর্যন্ত সক্রিয় থাকে। "
         "Binance Pay ২৪ ঘণ্টাই সচল।",
         reply_markup=kb,
+    )
+
+
+@router.message(F.text == BTN_REF)
+async def menu_referral(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    global _bot_username
+    if _bot_username is None:
+        _bot_username = (await bot.get_me()).username
+    link = f"https://t.me/{_bot_username}?start=ref_{message.from_user.id}"
+    total = count_referrals(message.from_user.id)
+    await message.answer(
+        "👥 <b>রেফারেল সিস্টেম</b>\n\n"
+        f"🎁 প্রতি রেফারে পাবেন <b>{fmt_money(REFERRAL_BONUS)} BDT</b>!\n\n"
+        "🔗 আপনার রেফার লিংক:\n"
+        f"<code>{link}</code>\n\n"
+        f"👤 মোট রেফার: {total} জন\n"
+        f"💰 মোট আয়: {fmt_money(total * REFERRAL_BONUS)} TK\n\n"
+        "📌 লিংকটি বন্ধুদের শেয়ার করুন। কেউ আপনার লিংকে প্রথমবার বট স্টার্ট করলেই বোনাস ব্যালেন্সে যোগ হবে।"
     )
 
 
@@ -1093,6 +1181,9 @@ def mfs_closed_text(method_name: str) -> str:
 async def cb_pay(call: CallbackQuery, state: FSMContext, bot: Bot):
     method = call.data.split(":", 1)[1]
     info = METHODS[method]
+    if method == "bkash" and not BKASH_ENABLED:
+        await call.answer(BKASH_OFF_TEXT, show_alert=True)
+        return
     if info["mfs"] and not mfs_is_open():
         await call.answer(mfs_closed_text(info["name"]), show_alert=True)
         return
@@ -1153,6 +1244,10 @@ async def got_deposit_amount(message: Message, state: FSMContext):
         await message.answer("⌛ সময় শেষ হয়ে গেছে। আবার ডিপোজিট শুরু করুন।", reply_markup=main_menu())
         return
     info = METHODS[method]
+    if method == "bkash" and not BKASH_ENABLED:
+        await state.clear()
+        await message.answer(BKASH_OFF_TEXT, reply_markup=main_menu())
+        return
     if info["mfs"] and not mfs_is_open():
         await state.clear()
         await message.answer(mfs_closed_text(info["name"]), reply_markup=main_menu())
