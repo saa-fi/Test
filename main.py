@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quest Sell Bot - aiogram 3.x, SQLite, single-file project.
+Passive Pay Bot - automated digital-goods store for Telegram (aiogram 3.x + SQLite).
 
 Every reply-keyboard button and every inline-keyboard button is colored using the
 Telegram Bot API 9.4 `style` field ("primary" = blue, "success" = green, "danger" = red).
@@ -54,7 +54,8 @@ from openpyxl import Workbook, load_workbook
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-PRIMARY_ADMIN_ID = 8002809016  # hardcoded primary admin (only one allowed to use /on and /off)
+_raw_primary = os.getenv("PRIMARY_ADMIN_ID", "").strip()
+PRIMARY_ADMIN_ID = int(_raw_primary) if _raw_primary.isdigit() else 0  # only one allowed to use /on and /off
 
 
 def _second_admin() -> Optional[int]:
@@ -72,16 +73,16 @@ def resolve_db_path() -> str:
         return explicit
     volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
     if volume:
-        return os.path.join(volume, "quest_sell.db")
-    return "quest_sell.db"
+        return os.path.join(volume, "passive_pay.db")
+    return "passive_pay.db"
 
 
 DB_PATH = resolve_db_path()
 
-SUPPORT_URL = "https://t.me/suppor9287"
-BKASH_NUMBER = "01705930972"
-NAGAD_NUMBER = "01995839364"
-BINANCE_UID = "1237510670"
+SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/telegram").strip()
+BKASH_NUMBER = os.getenv("BKASH_NUMBER", "Not set").strip()
+NAGAD_NUMBER = os.getenv("NAGAD_NUMBER", "Not set").strip()
+BINANCE_UID = os.getenv("BINANCE_UID", "Not set").strip()
 
 MIN_DEPOSIT = 2000  # 20 BDT in poisha
 MAX_AMOUNT = 100_000_000  # 1,000,000 BDT in poisha
@@ -97,7 +98,7 @@ NAME_PREFIX = " "  # decorative prefix from the spec's profile template; set to 
 OFF_TEXT = "🔴 Bot turned off."
 
 # bKash deposit switch: True = চালু, False = বন্ধ (শুধু bKash বন্ধ হবে, পুরো বট না)
-BKASH_ENABLED = False
+BKASH_ENABLED = os.getenv("BKASH_ENABLED", "0").strip() == "1"  # set BKASH_ENABLED=1 to turn on
 BKASH_OFF_TEXT = (
     "🔴 bKash এখন বন্ধ আছে (Turned off)।\n"
     "অনুগ্রহ করে Nagad অথবা Binance দিয়ে ডিপোজিট করুন।"
@@ -107,7 +108,7 @@ REFERRAL_BONUS = 70  # 0.70 BDT in poisha, per successful referral
 _bot_username: Optional[str] = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("quest_sell_bot")
+log = logging.getLogger("passive_pay_bot")
 
 # --------------------------------------------------------------------------- #
 # Catalog
@@ -115,14 +116,14 @@ log = logging.getLogger("quest_sell_bot")
 PRODUCTS = {
     "meta_ai": {
         "name": "Meta AI Account",
-        "label": "𝐌𝐞𝐭𝐚 𝐀𝐈 𝐀𝐜𝐜𝐨𝐮𝐧𝐭",
+        "label": "𝗠𝗲𝘁𝗮 𝗔𝗜 𝗔𝗰𝗰𝗼𝘂𝗻𝘁",
         "title": "Meta AI ID",
         "admin_label": "Meta Account",
         "price": 50,
     },
     "meta_horizon": {
         "name": "Meta Horizon",
-        "label": "𝐌𝐞𝐭𝐚 𝐇𝐨𝐫𝐢𝐳𝐨𝐧",
+        "label": "𝗠𝗲𝘁𝗮 𝗛𝗼𝗿𝗶𝘇𝗼𝗻",
         "title": "Meta Horizon",
         "admin_label": "Meta Horizon",
         "price": 55,
@@ -136,17 +137,17 @@ METHODS = {
 }
 
 # Reply-keyboard labels (users tap these; handlers match the exact text)
-BTN_BUY = "🛒 𝐁𝐮𝐲 𝐏𝐫𝐨𝐝𝐮𝐜𝐭𝐬"
-BTN_BAL = "💰 𝐁𝐚𝐥𝐚𝐧𝐜𝐞"
-BTN_DEP = "💳 𝐃𝐞𝐩𝐨𝐬𝐢𝐭"
-BTN_REF = "👥 𝐑𝐞𝐟𝐞𝐫𝐫𝐚𝐥𝐬"
-BTN_SUP = "📞 𝐒𝐮𝐩𝐩𝐨𝐫𝐭"
+BTN_BUY = "🛍️ 𝗦𝗵𝗼𝗽 𝗡𝗼𝘄"
+BTN_BAL = "👛 𝗠𝘆 𝗪𝗮𝗹𝗹𝗲𝘁"
+BTN_DEP = "➕ 𝗔𝗱𝗱 𝗙𝘂𝗻𝗱𝘀"
+BTN_REF = "🎁 𝗥𝗲𝗳𝗲𝗿 & 𝗘𝗮𝗿𝗻"
+BTN_SUP = "💬 𝗛𝗲𝗹𝗽 𝗗𝗲𝘀𝗸"
 
 WELCOME_TEXT = (
-    "👋 Welcome to Quest Sell Bot!\n\n"
-    "🛍️ আপনার পছন্দের প্রোডাক্ট কিনুন সহজেই।\n"
-    "💳 ব্যালেন্স ডিপোজিট করুন এবং অর্ডার সম্পন্ন করুন।\n\n"
-    "✨ Trusted Products | Fast Delivery"
+    "💎 <b>Passive Pay Bot-এ স্বাগতম!</b>\n\n"
+    "🛒 পছন্দের প্রোডাক্ট বেছে নিন, মুহূর্তেই ডেলিভারি পান।\n"
+    "👛 ওয়ালেটে ফান্ড যোগ করুন আর নিশ্চিন্তে কেনাকাটা করুন।\n\n"
+    "⚡ Instant Delivery • 🔒 Secure • 🤝 24/7 Support"
 )
 
 # --------------------------------------------------------------------------- #
@@ -235,7 +236,7 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 def cancel_flow_kb() -> InlineKeyboardMarkup:
-    return ikb([ibtn("❌ 𝐂𝐚𝐧𝐜𝐞𝐥", "flowcancel", style="danger")])
+    return ikb([ibtn("❌ 𝗖𝗮𝗻𝗰𝗲𝗹", "flowcancel", style="danger")])
 
 
 # --------------------------------------------------------------------------- #
@@ -628,8 +629,8 @@ def order_summary_text(order) -> str:
 
 def order_kb(order_id: int) -> InlineKeyboardMarkup:
     return ikb([
-        ibtn("✅ 𝐂𝐨𝐧𝐟𝐢𝐫𝐦 𝐎𝐫𝐝𝐞𝐫", f"cfm:{order_id}", style="success"),
-        ibtn("❌ 𝐂𝐚𝐧𝐜𝐞𝐥", f"cnl:{order_id}", style="danger"),
+        ibtn("✅ 𝗖𝗼𝗻𝗳𝗶𝗿𝗺 𝗢𝗿𝗱𝗲𝗿", f"cfm:{order_id}", style="success"),
+        ibtn("❌ 𝗖𝗮𝗻𝗰𝗲𝗹", f"cnl:{order_id}", style="danger"),
     ])
 
 
@@ -809,8 +810,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
     await state.clear()
     await message.answer(WELCOME_TEXT, reply_markup=main_menu())
 
-    # Referral: only for brand-new users opening a t.me/<bot>?start=ref_<id> link
-    m = re.fullmatch(r"ref_(\d{5,15})", (command.args or "").strip())
+    # Referral: only for brand-new users opening a t.me/<bot>?start=inv_<id> link
+    m = re.fullmatch(r"inv_(\d{5,15})", (command.args or "").strip())
     if not (m and is_new_user):
         return
     referrer_id = int(m.group(1))
@@ -821,7 +822,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
     await safe_send(
         bot,
         referrer_id,
-        "🎉 <b>নতুন রেফারেল!</b>\n\n"
+        "🎊 <b>নতুন রেফারেল বোনাস!</b>\n\n"
         f"👤 {name} আপনার লিংকে জয়েন করেছে।\n"
         f"➕ বোনাস: {fmt_money(REFERRAL_BONUS)} TK\n"
         f"👛 নতুন ব্যালেন্স: {fmt_money(new_balance)} TK",
@@ -907,7 +908,7 @@ async def cmd_broadcast(message: Message, state: FSMContext):
 async def menu_buy(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "🛍️ <b>Trusted Products</b> - প্রোডাক্ট সিলেক্ট করুন:", reply_markup=products_kb()
+        "🛍️ <b>Passive Pay Store</b>\n\nআপনার প্রোডাক্টটি বেছে নিন:", reply_markup=products_kb()
     )
 
 
@@ -919,10 +920,10 @@ async def menu_balance(message: Message, state: FSMContext):
     full_name = esc(message.from_user.full_name)
     balance = fmt_money(user["balance"] if user else 0)
     await message.answer(
-        "👤 <b>আমার প্রোফাইল</b>\n\n"
-        f"🆔 User Name: {username}\n"
-        f"👤 নাম: {NAME_PREFIX}{full_name}\n"
-        f"💰 ব্যালেন্স: {balance} TK"
+        "👛 <b>My Wallet</b>\n\n"
+        f"🔖 Username: {username}\n"
+        f"🙋 নাম: {NAME_PREFIX}{full_name}\n"
+        f"💎 ব্যালেন্স: {balance} TK"
     )
 
 
@@ -930,14 +931,14 @@ async def menu_balance(message: Message, state: FSMContext):
 async def menu_deposit(message: Message, state: FSMContext):
     await state.clear()
     kb = ikb(
-        [ibtn("🏦 𝐁𝐤𝐚𝐬𝐡", "pay:bkash", style="danger")],
-        [ibtn("💱 𝐍𝐚𝐠𝐚𝐝", "pay:nagad", style="primary")],
-        [ibtn("💳 𝐁𝐢𝐧𝐚𝐧𝐜𝐞", "pay:binance", style="success")],
+        [ibtn("🌸 𝗯𝗞𝗮𝘀𝗵", "pay:bkash", style="danger")],
+        [ibtn("🟠 𝗡𝗮𝗴𝗮𝗱", "pay:nagad", style="primary")],
+        [ibtn("🟡 𝗕𝗶𝗻𝗮𝗻𝗰𝗲", "pay:binance", style="success")],
     )
     await message.answer(
-        "💳 <b>ডিপোজিট মেথড সিলেক্ট করুন:</b>\n\n"
-        "💡 নোট: bKash, Nagad ডিপোজিট প্রতিদিন সকাল ০৯:০০ AM থেকে রাত ১১:০০ PM পর্যন্ত সক্রিয় থাকে। "
-        "Binance Pay ২৪ ঘণ্টাই সচল।",
+        "➕ <b>Add Funds</b>\n\nপেমেন্ট মেথড বেছে নিন:\n\n"
+        "ℹ️ bKash ও Nagad প্রতিদিন সকাল ০৯:০০ থেকে রাত ১১:০০ পর্যন্ত চালু থাকে। "
+        "Binance Pay চালু থাকে ২৪/৭।",
         reply_markup=kb,
     )
 
@@ -948,16 +949,16 @@ async def menu_referral(message: Message, state: FSMContext, bot: Bot):
     global _bot_username
     if _bot_username is None:
         _bot_username = (await bot.get_me()).username
-    link = f"https://t.me/{_bot_username}?start=ref_{message.from_user.id}"
+    link = f"https://t.me/{_bot_username}?start=inv_{message.from_user.id}"
     total = count_referrals(message.from_user.id)
     await message.answer(
-        "👥 <b>রেফারেল সিস্টেম</b>\n\n"
-        f"🎁 প্রতি রেফারে পাবেন <b>{fmt_money(REFERRAL_BONUS)} BDT</b>!\n\n"
-        "🔗 আপনার রেফার লিংক:\n"
+        "🎁 <b>Refer &amp; Earn</b>\n\n"
+        f"💸 প্রতি সফল রেফারে পাবেন <b>{fmt_money(REFERRAL_BONUS)} BDT</b>!\n\n"
+        "🔗 আপনার ইনভাইট লিংক:\n"
         f"<code>{link}</code>\n\n"
-        f"👤 মোট রেফার: {total} জন\n"
-        f"💰 মোট আয়: {fmt_money(total * REFERRAL_BONUS)} TK\n\n"
-        "📌 লিংকটি বন্ধুদের শেয়ার করুন। কেউ আপনার লিংকে প্রথমবার বট স্টার্ট করলেই বোনাস ব্যালেন্সে যোগ হবে।"
+        f"🧑‍🤝‍🧑 মোট রেফার: {total} জন\n"
+        f"💎 মোট আয়: {fmt_money(total * REFERRAL_BONUS)} TK\n\n"
+        "📌 লিংকটি শেয়ার করুন। কেউ আপনার লিংক দিয়ে প্রথমবার বট চালু করলেই বোনাস সরাসরি ওয়ালেটে জমা হবে।"
     )
 
 
@@ -965,9 +966,9 @@ async def menu_referral(message: Message, state: FSMContext, bot: Bot):
 async def menu_support(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "📞 <b>সাপোর্ট ও সাহায্য</b>\n\n"
-        "যেকোনো সমস্যা বা সহায়তার জন্য নিচের বাটনে ক্লিক করে অ্যাডমিনের সাথে যোগাযোগ করুন:",
-        reply_markup=ikb([ibtn("👨‍💻 𝐂𝐨𝐧𝐭𝐚𝐜𝐭 𝐀𝐝𝐦𝐢𝐧", url=SUPPORT_URL, style="primary")]),
+        "💬 <b>Help Desk</b>\n\n"
+        "কোনো সমস্যা বা প্রশ্ন থাকলে নিচের বাটনে ট্যাপ করে আমাদের টিমকে জানান:",
+        reply_markup=ikb([ibtn("🎧 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗧𝗲𝗮𝗺", url=SUPPORT_URL, style="primary")]),
     )
 
 
@@ -1110,14 +1111,14 @@ async def deliver_order(bot: Bot, order_id: int) -> bool:
         return False
     meta = PRODUCTS.get(order["product_code"], {"name": order["product_code"]})
     caption = (
-        "✅ <b>অর্ডার সফল হয়েছে!</b>\n\n"
-        f"🧾 অর্ডার ID: <code>#{order_id}</code>\n"
-        f"📦 প্রোডাক্ট: {esc(meta['name'])}\n"
+        "🎉 <b>ডেলিভারি সম্পন্ন!</b>\n\n"
+        f"🧾 Order No: <code>#{order_id}</code>\n"
+        f"🏷️ প্রোডাক্ট: {esc(meta['name'])}\n"
         f"🔢 পরিমাণ: {order['quantity']}\n"
-        f"💰 কাটা হয়েছে: {fmt_money(order['total_price'])} TK"
+        f"💎 মোট খরচ: {fmt_money(order['total_price'])} TK"
     )
     payload = build_xlsx(accounts)
-    filename = f"order_{order_id}_{order['product_code']}.xlsx"
+    filename = f"PassivePay_{order_id}_{order['product_code']}.xlsx"
     for _ in range(3):
         try:
             await bot.send_document(
@@ -1207,8 +1208,8 @@ def payment_instruction_text(method: str, amount: int) -> str:
     amt = fmt_money(amount)
     if method == "bkash":
         return (
-            "🎉 <b>অটো পেমেন্ট সিস্টেম তৈরি করা হয়েছে</b>\n☑️\n\n"
-            f"☑️ পরিমাণ: <b>{amt}</b> টাকা (ঠিক এই অ্যামাউন্ট পাঠাবেন)\n\n"
+            "🧾 <b>পেমেন্ট ইনভয়েস তৈরি হয়েছে</b>\n\n"
+            f"💵 পরিমাণ: <b>{amt}</b> টাকা (ঠিক এই অ্যামাউন্টই পাঠাবেন)\n\n"
             "💚 <b>BKASH</b>\n\n"
             "📱 Personal (Send Money):\n"
             f"<code>{BKASH_NUMBER}</code>\n\n"
@@ -1217,8 +1218,8 @@ def payment_instruction_text(method: str, amount: int) -> str:
         )
     if method == "nagad":
         return (
-            "🎉 <b>অটো পেমেন্ট সিস্টেম তৈরি করা হয়েছে</b>\n☑️\n\n"
-            f"☑️ পরিমাণ: <b>{amt}</b> টাকা (ঠিক এই অ্যামাউন্ট পাঠাবেন)\n\n"
+            "🧾 <b>পেমেন্ট ইনভয়েস তৈরি হয়েছে</b>\n\n"
+            f"💵 পরিমাণ: <b>{amt}</b> টাকা (ঠিক এই অ্যামাউন্টই পাঠাবেন)\n\n"
             "🧡 <b>NAGAD</b>\n\n"
             "📱 Personal (Send Money):\n"
             f"<code>{NAGAD_NUMBER}</code>\n\n"
@@ -1226,8 +1227,8 @@ def payment_instruction_text(method: str, amount: int) -> str:
             "⚠️ আগে পেমেন্ট করুন, তারপর সঠিক TrxID পাঠান। অ্যাডমিন ম্যানুয়ালি যাচাই করে ব্যালেন্স যোগ করবেন।"
         )
     return (
-        "🎉 <b>পেমেন্ট ইনস্ট্রাকশন তৈরি করা হয়েছে</b>\n☑️\n\n"
-        f"☑️ পরিমাণ: <b>{amt}</b> টাকা (ঠিক এই অ্যামাউন্ট পাঠাবেন)\n\n"
+        "🧾 <b>পেমেন্ট ইনভয়েস তৈরি হয়েছে</b>\n\n"
+        f"💵 পরিমাণ: <b>{amt}</b> টাকা (ঠিক এই অ্যামাউন্টই পাঠাবেন)\n\n"
         "💛 <b>BINANCE PAY</b>\n\n"
         "🆔 Binance Pay UID:\n"
         f"<code>{BINANCE_UID}</code>\n\n"
@@ -1614,6 +1615,11 @@ async def on_error(event: ErrorEvent):
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN environment variable is not set.")
+    if not PRIMARY_ADMIN_ID:
+        raise SystemExit("PRIMARY_ADMIN_ID environment variable is not set.")
+    for _name in ("SUPPORT_URL", "BKASH_NUMBER", "NAGAD_NUMBER", "BINANCE_UID"):
+        if not os.getenv(_name, "").strip():
+            log.warning("%s is not set - using a placeholder.", _name)
     init_db()
     log.info("Database: %s | Admins: %s", DB_PATH, sorted(ADMIN_IDS))
     if SECOND_ADMIN_ID is None:
@@ -1625,7 +1631,7 @@ async def main() -> None:
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=False)
-    log.info("Quest Sell Bot started (polling).")
+    log.info("Passive Pay Bot started (polling).")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
