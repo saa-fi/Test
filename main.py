@@ -509,6 +509,33 @@ def create_custom_product(name: str, price: int) -> str:
         return code
 
 
+def set_product_active(code: str, active: bool) -> None:
+    if get_product(code) is not None:
+        _ref(f"products/{code}/active").set(1 if active else 0)
+
+
+def list_active_products() -> list:
+    """(code, display name) of every product that is currently on sale (for /disabled)."""
+    products = dict(_items(_ref("products").get()))
+
+    def on_sale(code: str) -> bool:
+        p = products.get(code)
+        return bool(p) and bool(p.get("active", 1))
+
+    out = []
+    for code, meta in PRODUCTS.items():
+        if on_sale(code):
+            out.append((code, meta["admin_label"]))
+    for p in list_custom_products():
+        if on_sale(p["code"]):
+            out.append((p["code"], p["name"]))
+    for v in list_vpns():
+        code = f"{VPN_PREFIX}{v['id']}"
+        if on_sale(code):
+            out.append((code, f"🛡️ {v['name']} ({v['days']} Days)"))
+    return out
+
+
 def is_stockable_product(code) -> bool:
     """Products that /account can add stock to (VPNs are managed with /vpn)."""
     if not isinstance(code, str):
@@ -1199,7 +1226,7 @@ async def got_quantity(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "vpnlist")
 async def cb_vpn_list(call: CallbackQuery, bot: Bot):
-    vpns = list_vpns()
+    vpns = [v for v in list_vpns() if (get_product(f"{VPN_PREFIX}{v['id']}") or {}).get("active", 1)]
     if not vpns:
         await call.answer("❌ এখন কোনো VPN নেই।", show_alert=True)
         return
@@ -1836,6 +1863,69 @@ async def product_get_price(message: Message, state: FSMContext):
         "🛍️ Shop Now এ ইউজাররা এখন এই প্রোডাক্ট দেখতে পাবে।\n"
         "📦 স্টক যোগ করতে /account দিন।"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Admin: /disabled (take a product off sale)
+# --------------------------------------------------------------------------- #
+@router.message(Command("disabled"))
+async def cmd_disabled(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await message.answer("⛔ এই কমান্ড আপনার জন্য নয়।")
+        return
+    await state.clear()
+    items = list_active_products()
+    if not items:
+        await message.answer("❌ এখন কোনো চালু প্রোডাক্ট নেই।")
+        return
+    rows = [[ibtn(name, f"dis:{code}", style="primary")] for code, name in items]
+    await message.answer(
+        "🚫 কোন প্রোডাক্টটি Disable করবেন?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^dis:[A-Za-z0-9_]+$"))
+async def cb_disable_select(call: CallbackQuery):
+    if not is_stock_admin(call.from_user.id):
+        await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
+        return
+    code = call.data.split(":", 1)[1]
+    meta = product_meta(code)
+    product = get_product(code)
+    if meta is None or product is None or not product["active"]:
+        await call.answer("❌ প্রোডাক্ট পাওয়া যায়নি বা আগেই বন্ধ আছে।", show_alert=True)
+        return
+    await call.answer()
+    await safe_edit(
+        call.message,
+        f"⚠️ <b>{esc(meta['name'])}</b> Disable করতে চান?\n\n"
+        "Disable করলে এটি Shop Now থেকে সরে যাবে এবং কেউ কিনতে পারবে না।",
+        ikb([
+            ibtn("✅ Confirm", f"disok:{code}", style="success"),
+            ibtn("❌ Cancel", "flowcancel", style="danger"),
+        ]),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^disok:[A-Za-z0-9_]+$"))
+async def cb_disable_confirm(call: CallbackQuery):
+    if not is_stock_admin(call.from_user.id):
+        await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
+        return
+    code = call.data.split(":", 1)[1]
+    meta = product_meta(code)
+    product = get_product(code)
+    if meta is None or product is None:
+        await call.answer("❌ প্রোডাক্ট পাওয়া যায়নি।", show_alert=True)
+        return
+    if not product["active"]:
+        await call.answer("⚠️ এটি আগেই Disable করা আছে।", show_alert=True)
+        await safe_edit(call.message, f"🚫 <b>{esc(meta['name'])}</b> আগেই Disable করা আছে।")
+        return
+    set_product_active(code, False)
+    await call.answer("🚫 Disabled")
+    await safe_edit(call.message, f"🚫 <b>{esc(meta['name'])}</b> Disable করা হয়েছে। এটি আর Shop Now এ দেখাবে না।")
 
 
 # --------------------------------------------------------------------------- #
