@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Passive Pay Bot - automated digital-goods store for Telegram (aiogram 3.x + SQLite).
+NEXA STORE - automated digital-goods store for Telegram (aiogram 3.x + SQLite).
 
 Every reply-keyboard button and every inline-keyboard button is colored using the
 Telegram Bot API 9.4 `style` field ("primary" = blue, "success" = green, "danger" = red).
@@ -79,9 +79,9 @@ def resolve_db_path() -> str:
 DB_PATH = resolve_db_path()
 
 SUPPORT_URL = "https://t.me/suppor9287"
-BKASH_NUMBER = "01705930972"
-NAGAD_NUMBER = "01995839364"
-BINANCE_UID = "1237510670"
+BKASH_NUMBER = "01533235544"
+NAGAD_NUMBER = "01533235544"
+BINANCE_UID = "1019679566"
 
 MIN_DEPOSIT = 2000  # 20 BDT in poisha
 MAX_AMOUNT = 100_000_000  # 1,000,000 BDT in poisha
@@ -97,7 +97,7 @@ NAME_PREFIX = " "  # decorative prefix from the spec's profile template; set to 
 OFF_TEXT = "🔴 Bot turned off."
 
 # bKash deposit switch: True = চালু, False = বন্ধ (শুধু bKash বন্ধ হবে, পুরো বট না)
-BKASH_ENABLED = False
+BKASH_ENABLED = True
 BKASH_OFF_TEXT = (
     "🔴 bKash এখন বন্ধ আছে (Turned off)।\n"
     "অনুগ্রহ করে Nagad অথবা Binance দিয়ে ডিপোজিট করুন।"
@@ -143,7 +143,7 @@ BTN_REF = "🎁 𝗥𝗲𝗳𝗲𝗿 & 𝗘𝗮𝗿𝗻"
 BTN_SUP = "💬 𝗛𝗲𝗹𝗽 𝗗𝗲𝘀𝗸"
 
 WELCOME_TEXT = (
-    "💎 <b>Passive Pay Bot-এ স্বাগতম!</b>\n\n"
+    "💎 <b>NEXA STORE-এ স্বাগতম!</b>\n\n"
     "🛒 পছন্দের প্রোডাক্ট বেছে নিন, মুহূর্তেই ডেলিভারি পান।\n"
     "👛 ওয়ালেটে ফান্ড যোগ করুন আর নিশ্চিন্তে কেনাকাটা করুন।\n\n"
     "⚡ Instant Delivery • 🔒 Secure • 🤝 24/7 Support"
@@ -233,7 +233,7 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [kbtn(BTN_BUY, "primary")],
             [kbtn(BTN_BAL, "success"), kbtn(BTN_DEP, "success")],
-            [kbtn(BTN_REF, "success"), kbtn(BTN_SUP, "primary")],
+            [kbtn(BTN_SUP, "primary")],
         ],
         resize_keyboard=True,
     )
@@ -345,7 +345,7 @@ def init_db() -> None:
     for code, meta in PRODUCTS.items():
         db.execute(
             "INSERT INTO products (code, name, price, active) VALUES (?, ?, ?, 1) "
-            "ON CONFLICT(code) DO UPDATE SET price=excluded.price",
+            "ON CONFLICT(code) DO UPDATE SET name=excluded.name",
             (code, meta["name"], meta["price"]),
         )
     db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_enabled', '1')")
@@ -477,6 +477,10 @@ def product_meta(code: str) -> Optional[dict]:
     if vpn:
         return {"name": f"{vpn['name']} ({vpn['days']} Days)", "title": f"{vpn['name']} ({vpn['days']} Days)"}
     return None
+
+
+def set_product_price(code: str, price: int) -> None:
+    db.execute("UPDATE products SET price=? WHERE code=?", (price, code))
 
 
 def get_stock(code: str) -> int:
@@ -800,6 +804,10 @@ class AdminUpload(StatesGroup):
     file = State()
 
 
+class AdminPrice(StatesGroup):
+    amount = State()
+
+
 class AdminVpn(StatesGroup):
     name = State()
     days = State()
@@ -867,28 +875,9 @@ def not_command(message: Message) -> bool:
 # Commands
 # --------------------------------------------------------------------------- #
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: CommandObject,
-                    is_new_user: bool = False):
+async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(WELCOME_TEXT, reply_markup=main_menu())
-
-    # Referral: only for brand-new users opening a t.me/<bot>?start=ref_<id> link
-    m = re.fullmatch(r"ref_(\d{5,15})", (command.args or "").strip())
-    if not (m and is_new_user):
-        return
-    referrer_id = int(m.group(1))
-    new_balance = register_referral(message.from_user.id, referrer_id)
-    if new_balance is None:
-        return
-    name = esc(message.from_user.full_name)
-    await safe_send(
-        bot,
-        referrer_id,
-        "🎊 <b>নতুন রেফারেল বোনাস!</b>\n\n"
-        f"👤 {name} আপনার লিংকে জয়েন করেছে।\n"
-        f"➕ বোনাস: {fmt_money(REFERRAL_BONUS)} TK\n"
-        f"👛 নতুন ব্যালেন্স: {fmt_money(new_balance)} TK",
-    )
 
 
 @router.message(Command("cancel"))
@@ -970,7 +959,7 @@ async def cmd_broadcast(message: Message, state: FSMContext):
 async def menu_buy(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "🛍️ <b>Passive Pay Store</b>\n\nআপনার প্রোডাক্টটি বেছে নিন:", reply_markup=products_kb()
+        "🛍️ <b>NEXA STORE</b>\n\nআপনার প্রোডাক্টটি বেছে নিন:", reply_markup=products_kb()
     )
 
 
@@ -1002,25 +991,6 @@ async def menu_deposit(message: Message, state: FSMContext):
         "ℹ️ bKash ও Nagad প্রতিদিন সকাল ০৯:০০ থেকে রাত ১১:০০ পর্যন্ত চালু থাকে। "
         "Binance Pay চালু থাকে ২৪/৭।",
         reply_markup=kb,
-    )
-
-
-@router.message(F.text == BTN_REF)
-async def menu_referral(message: Message, state: FSMContext, bot: Bot):
-    await state.clear()
-    global _bot_username
-    if _bot_username is None:
-        _bot_username = (await bot.get_me()).username
-    link = f"https://t.me/{_bot_username}?start=ref_{message.from_user.id}"
-    total = count_referrals(message.from_user.id)
-    await message.answer(
-        "🎁 <b>Refer &amp; Earn</b>\n\n"
-        f"💸 প্রতি সফল রেফারে পাবেন <b>{fmt_money(REFERRAL_BONUS)} BDT</b>!\n\n"
-        "🔗 আপনার ইনভাইট লিংক:\n"
-        f"<code>{link}</code>\n\n"
-        f"🧑‍🤝‍🧑 মোট রেফার: {total} জন\n"
-        f"💎 মোট আয়: {fmt_money(total * REFERRAL_BONUS)} TK\n\n"
-        "📌 লিংকটি শেয়ার করুন। কেউ আপনার লিংক দিয়ে প্রথমবার বট চালু করলেই বোনাস সরাসরি ওয়ালেটে জমা হবে।"
     )
 
 
@@ -1200,7 +1170,7 @@ async def deliver_order(bot: Bot, order_id: int) -> bool:
         f"💎 মোট খরচ: {fmt_money(order['total_price'])} TK"
     )
     payload = build_xlsx(accounts)
-    filename = f"PassivePay_{order_id}_{order['product_code']}.xlsx"
+    filename = f"NexaStore_{order_id}_{order['product_code']}.xlsx"
     for _ in range(3):
         try:
             await bot.send_document(
@@ -1632,6 +1602,61 @@ async def admin_upload_file(message: Message, state: FSMContext, bot: Bot):
 
 
 # --------------------------------------------------------------------------- #
+# Admin: /price
+# --------------------------------------------------------------------------- #
+@router.message(Command("price"))
+async def cmd_price(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await message.answer("⛔ এই কমান্ড আপনার জন্য নয়।")
+        return
+    await state.clear()
+    rows = [[ibtn(meta["admin_label"], f"prc:{code}", style="primary")] for code, meta in PRODUCTS.items()]
+    await message.answer("💰 Select a product to set price:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.regexp(r"^prc:(meta_ai|meta_horizon)$"))
+async def cb_price_select(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_stock_admin(call.from_user.id):
+        await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
+        return
+    code = call.data.split(":", 1)[1]
+    product = get_product(code)
+    await call.answer()
+    await state.clear()
+    await state.set_state(AdminPrice.amount)
+    await state.update_data(code=code)
+    await safe_send(
+        bot,
+        call.from_user.id,
+        f"💰 <b>{esc(PRODUCTS[code]['name'])}</b>\n"
+        f"বর্তমান প্রাইস: {fmt_money(product['price'])} TK\n\n"
+        "নতুন প্রাইস দিন (BDT, যেমন: 50 বা 12.50):",
+        reply_markup=cancel_flow_kb(),
+    )
+
+
+@router.message(AdminPrice.amount, F.text, not_command)
+async def price_get_amount(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    code = data.get("code")
+    price = parse_amount(message.text)
+    if price is None:
+        await message.answer("❌ সঠিক প্রাইস লিখুন (ধনাত্মক সংখ্যা, সর্বোচ্চ ২ দশমিক ঘর)।")
+        return
+    await state.clear()
+    if code not in PRODUCTS:
+        await message.answer("❌ কিছু ভুল হয়েছে। /price দিয়ে আবার শুরু করুন।")
+        return
+    set_product_price(code, price)
+    await message.answer(
+        f"✅ <b>{esc(PRODUCTS[code]['name'])}</b> এর প্রাইস সেট হয়েছে: {fmt_money(price)} TK"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Admin: /vpn
 # --------------------------------------------------------------------------- #
 VPN_FILE_PROMPT = (
@@ -1855,7 +1880,12 @@ async def main() -> None:
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=False)
-    log.info("Passive Pay Bot started (polling).")
+    try:  # show "NEXA STORE" as the bot's display name in Telegram
+        if (await bot.get_my_name()).name != "NEXA STORE":
+            await bot.set_my_name("NEXA STORE")
+    except TelegramAPIError as e:
+        log.warning("Could not set bot name (set it in @BotFather): %s", type(e).__name__)
+    log.info("NEXA STORE started (polling).")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
