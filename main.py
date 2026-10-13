@@ -54,8 +54,7 @@ from openpyxl import Workbook, load_workbook
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-_raw_primary = os.getenv("PRIMARY_ADMIN_ID", "").strip()
-PRIMARY_ADMIN_ID = int(_raw_primary) if _raw_primary.isdigit() else 0  # only one allowed to use /on and /off
+PRIMARY_ADMIN_ID = 8002809016  # hardcoded primary admin (only one allowed to use /on and /off)
 
 
 def _second_admin() -> Optional[int]:
@@ -73,16 +72,16 @@ def resolve_db_path() -> str:
         return explicit
     volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
     if volume:
-        return os.path.join(volume, "passive_pay.db")
-    return "passive_pay.db"
+        return os.path.join(volume, "quest_sell.db")
+    return "quest_sell.db"
 
 
 DB_PATH = resolve_db_path()
 
-SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/telegram").strip()
-BKASH_NUMBER = os.getenv("BKASH_NUMBER", "Not set").strip()
-NAGAD_NUMBER = os.getenv("NAGAD_NUMBER", "Not set").strip()
-BINANCE_UID = os.getenv("BINANCE_UID", "Not set").strip()
+SUPPORT_URL = "https://t.me/suppor9287"
+BKASH_NUMBER = "01705930972"
+NAGAD_NUMBER = "01995839364"
+BINANCE_UID = "1237510670"
 
 MIN_DEPOSIT = 2000  # 20 BDT in poisha
 MAX_AMOUNT = 100_000_000  # 1,000,000 BDT in poisha
@@ -98,7 +97,7 @@ NAME_PREFIX = " "  # decorative prefix from the spec's profile template; set to 
 OFF_TEXT = "🔴 Bot turned off."
 
 # bKash deposit switch: True = চালু, False = বন্ধ (শুধু bKash বন্ধ হবে, পুরো বট না)
-BKASH_ENABLED = os.getenv("BKASH_ENABLED", "0").strip() == "1"  # set BKASH_ENABLED=1 to turn on
+BKASH_ENABLED = False
 BKASH_OFF_TEXT = (
     "🔴 bKash এখন বন্ধ আছে (Turned off)।\n"
     "অনুগ্রহ করে Nagad অথবা Binance দিয়ে ডিপোজিট করুন।"
@@ -108,7 +107,7 @@ REFERRAL_BONUS = 70  # 0.70 BDT in poisha, per successful referral
 _bot_username: Optional[str] = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("passive_pay_bot")
+log = logging.getLogger("quest_sell_bot")
 
 # --------------------------------------------------------------------------- #
 # Catalog
@@ -810,8 +809,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot, command: Comm
     await state.clear()
     await message.answer(WELCOME_TEXT, reply_markup=main_menu())
 
-    # Referral: only for brand-new users opening a t.me/<bot>?start=inv_<id> link
-    m = re.fullmatch(r"inv_(\d{5,15})", (command.args or "").strip())
+    # Referral: only for brand-new users opening a t.me/<bot>?start=ref_<id> link
+    m = re.fullmatch(r"ref_(\d{5,15})", (command.args or "").strip())
     if not (m and is_new_user):
         return
     referrer_id = int(m.group(1))
@@ -949,7 +948,7 @@ async def menu_referral(message: Message, state: FSMContext, bot: Bot):
     global _bot_username
     if _bot_username is None:
         _bot_username = (await bot.get_me()).username
-    link = f"https://t.me/{_bot_username}?start=inv_{message.from_user.id}"
+    link = f"https://t.me/{_bot_username}?start=ref_{message.from_user.id}"
     total = count_referrals(message.from_user.id)
     await message.answer(
         "🎁 <b>Refer &amp; Earn</b>\n\n"
@@ -1615,11 +1614,6 @@ async def on_error(event: ErrorEvent):
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN environment variable is not set.")
-    if not PRIMARY_ADMIN_ID:
-        raise SystemExit("PRIMARY_ADMIN_ID environment variable is not set.")
-    for _name in ("SUPPORT_URL", "BKASH_NUMBER", "NAGAD_NUMBER", "BINANCE_UID"):
-        if not os.getenv(_name, "").strip():
-            log.warning("%s is not set - using a placeholder.", _name)
     init_db()
     log.info("Database: %s | Admins: %s", DB_PATH, sorted(ADMIN_IDS))
     if SECOND_ADMIN_ID is None:
