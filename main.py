@@ -107,7 +107,7 @@ log = logging.getLogger("quest_sell_bot")
 # --------------------------------------------------------------------------- #
 # Catalog
 # --------------------------------------------------------------------------- #
-# Meta AI / Meta Horizon are disabled. Products are now added by the admin with /product.
+# Meta AI / Meta Horizon are disabled. Products are now added by the admin with /meta.
 PRODUCTS: dict = {}
 # To re-enable the old fixed products, restore this block as PRODUCTS = {...}:
 # PRODUCTS = {
@@ -441,7 +441,7 @@ def get_product(code: str):
 
 
 VPN_PREFIX = "vpn_"
-CUSTOM_PREFIX = "p_"  # products added by the admin with /product
+CUSTOM_PREFIX = "p_"  # products added by the admin with /meta
 
 
 def _vpn_row(vpn_id, d: dict) -> dict:
@@ -818,7 +818,7 @@ def products_kb() -> InlineKeyboardMarkup:
 
 
 def meta_products_kb() -> InlineKeyboardMarkup:
-    """Products inside Meta AI: everything the admin added with /product."""
+    """Products inside Meta AI: everything the admin added with /meta."""
     rows = []
     for code, meta in PRODUCTS.items():
         product = get_product(code)
@@ -1084,7 +1084,7 @@ async def cmd_account(message: Message, state: FSMContext):
     rows = [[ibtn(meta["admin_label"], f"acc:{code}", style="primary")] for code, meta in PRODUCTS.items()]
     rows += [[ibtn(p["name"], f"acc:{p['code']}", style="primary")] for p in list_custom_products()]
     if not rows:
-        await message.answer("❌ এখনো কোনো প্রোডাক্ট নেই। /product দিয়ে নতুন প্রোডাক্ট যোগ করুন।")
+        await message.answer("❌ এখনো কোনো প্রোডাক্ট নেই। /meta দিয়ে নতুন প্রোডাক্ট যোগ করুন।")
         return
     await message.answer("📦 Select Products", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1782,7 +1782,7 @@ async def cmd_price(message: Message, state: FSMContext):
     rows = [[ibtn(meta["admin_label"], f"prc:{code}", style="primary")] for code, meta in PRODUCTS.items()]
     rows += [[ibtn(p["name"], f"prc:{p['code']}", style="primary")] for p in list_custom_products()]
     if not rows:
-        await message.answer("❌ এখনো কোনো প্রোডাক্ট নেই। /product দিয়ে নতুন প্রোডাক্ট যোগ করুন।")
+        await message.answer("❌ এখনো কোনো প্রোডাক্ট নেই। /meta দিয়ে নতুন প্রোডাক্ট যোগ করুন।")
         return
     await message.answer("💰 Select a product to set price:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1833,9 +1833,9 @@ async def price_get_amount(message: Message, state: FSMContext):
 
 
 # --------------------------------------------------------------------------- #
-# Admin: /product (add a new product to Shop Now)
+# Admin: /meta (add a new product to Shop Now)
 # --------------------------------------------------------------------------- #
-@router.message(Command("product"))
+@router.message(Command("meta"))
 async def cmd_product(message: Message, state: FSMContext):
     if not is_stock_admin(message.from_user.id):
         await message.answer("⛔ এই কমান্ড আপনার জন্য নয়।")
@@ -1875,12 +1875,12 @@ async def product_get_price(message: Message, state: FSMContext):
     name = data.get("name")
     await state.clear()
     if not name:
-        await message.answer("❌ কিছু ভুল হয়েছে। /product দিয়ে আবার শুরু করুন।")
+        await message.answer("❌ কিছু ভুল হয়েছে। /meta দিয়ে আবার শুরু করুন।")
         return
     try:
         create_custom_product(name, price)
     except ValueError:
-        await message.answer("❌ এই নামে প্রোডাক্ট আগে থেকেই আছে। /product দিয়ে আবার শুরু করুন।")
+        await message.answer("❌ এই নামে প্রোডাক্ট আগে থেকেই আছে। /meta দিয়ে আবার শুরু করুন।")
         return
     await message.answer(
         f"✅ <b>{esc(name)}</b> যোগ হয়েছে।\n"
