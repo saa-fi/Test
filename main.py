@@ -7,6 +7,7 @@ Telegram Bot API 9.4 `style` field ("primary" = blue, "success" = green, "danger
 """
 
 import asyncio
+import base64
 import hashlib
 import html
 import io
@@ -261,13 +262,19 @@ def _init_firebase() -> None:
         raise SystemExit("FIREBASE_CREDENTIALS environment variable is not set.")
     if not DATABASE_URL:
         raise SystemExit("DATABASE_URL environment variable is not set.")
-    if FIREBASE_CREDENTIALS.startswith("{"):
-        info = json.loads(FIREBASE_CREDENTIALS, strict=False)
+    raw = FIREBASE_CREDENTIALS
+    if not raw.startswith("{") and not os.path.isfile(raw):  # base64-encoded JSON
+        try:
+            raw = base64.b64decode(raw).decode("utf-8")
+        except Exception:
+            pass
+    if raw.startswith("{"):
+        info = json.loads(raw, strict=False)
         if isinstance(info.get("private_key"), str):
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         cred = credentials.Certificate(info)
     else:  # path to a service-account JSON file
-        cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+        cred = credentials.Certificate(raw)
     firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
 
 
