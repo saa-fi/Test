@@ -207,6 +207,11 @@ def is_primary(user_id: Optional[int]) -> bool:
     return user_id == PRIMARY_ADMIN_ID
 
 
+def is_stock_admin(user_id: Optional[int]) -> bool:
+    """Admins allowed to use /vpn, /account, /broadcast (primary admin is limited to /add, /on, /off)."""
+    return is_admin(user_id) and not is_primary(user_id)
+
+
 # --------------------------------------------------------------------------- #
 # Colored keyboard builders (Bot API 9.4 `style`)
 # --------------------------------------------------------------------------- #
@@ -329,6 +334,12 @@ def init_db() -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS vpns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            days INTEGER NOT NULL,
+            price INTEGER NOT NULL
+        );
         """
     )
     for code, meta in PRODUCTS.items():
@@ -427,6 +438,45 @@ def count_referrals(user_id: int) -> int:
 # ---- products / stock ----------------------------------------------------- #
 def get_product(code: str):
     return db.execute("SELECT * FROM products WHERE code=?", (code,)).fetchone()
+
+
+VPN_PREFIX = "vpn_"
+
+
+def get_vpn_by_name(name: str):
+    return db.execute("SELECT * FROM vpns WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+
+
+def get_vpn_by_code(code: str):
+    if not code.startswith(VPN_PREFIX) or not code[len(VPN_PREFIX):].isdigit():
+        return None
+    return db.execute("SELECT * FROM vpns WHERE id=?", (int(code[len(VPN_PREFIX):]),)).fetchone()
+
+
+def list_vpns() -> list:
+    return db.execute("SELECT * FROM vpns ORDER BY id").fetchall()
+
+
+def create_vpn(name: str, days: int, price: int) -> str:
+    """Create a VPN (also registered as a product so the normal buy flow works). Returns its code."""
+    with tx():
+        cur = db.execute("INSERT INTO vpns (name, days, price) VALUES (?, ?, ?)", (name, days, price))
+        code = f"{VPN_PREFIX}{cur.lastrowid}"
+        db.execute(
+            "INSERT INTO products (code, name, price, active) VALUES (?, ?, ?, 1)",
+            (code, name, price),
+        )
+        return code
+
+
+def product_meta(code: str) -> Optional[dict]:
+    meta = PRODUCTS.get(code)
+    if meta:
+        return meta
+    vpn = get_vpn_by_code(code)
+    if vpn:
+        return {"name": f"{vpn['name']} ({vpn['days']} Days)", "title": f"{vpn['name']} ({vpn['days']} Days)"}
+    return None
 
 
 def get_stock(code: str) -> int:
@@ -616,7 +666,7 @@ def get_deposit_msgs(dep_id: int) -> list:
 # Text builders
 # --------------------------------------------------------------------------- #
 def order_summary_text(order) -> str:
-    meta = PRODUCTS[order["product_code"]]
+    meta = product_meta(order["product_code"]) or {"title": order["product_code"]}
     return (
         f"🛒 <b>{esc(meta['title'])}</b>\n\n"
         f"💰 প্রাইস: {fmt_money(order['unit_price'])} TK\n"
@@ -644,7 +694,13 @@ def products_kb() -> InlineKeyboardMarkup:
                 style="primary",
             )
         ])
+    rows.append([ibtn("VPN 🛡️", "vpnlist", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def vpn_label(vpn) -> str:
+    code = f"{VPN_PREFIX}{vpn['id']}"
+    return f"🛡️ {vpn['name']} | ⌛ {vpn['days']} Days | {price_short(vpn['price'])} BDT | Stock: {get_stock(code)}"
 
 
 def deposit_admin_text(dep, user, note: Optional[str] = None) -> str:
@@ -741,6 +797,13 @@ class AdminAdd(StatesGroup):
 
 
 class AdminUpload(StatesGroup):
+    file = State()
+
+
+class AdminVpn(StatesGroup):
+    name = State()
+    days = State()
+    price = State()
     file = State()
 
 
@@ -882,7 +945,7 @@ async def cmd_add(message: Message, state: FSMContext):
 
 @router.message(Command("account", ignore_case=True))
 async def cmd_account(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_stock_admin(message.from_user.id):
         await message.answer("⛔ আপনি অ্যাডমিন নন।")
         return
     await state.clear()
@@ -892,7 +955,7 @@ async def cmd_account(message: Message, state: FSMContext):
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_stock_admin(message.from_user.id):
         await message.answer("⛔ আপনি অ্যাডমিন নন।")
         return
     await state.clear()
@@ -988,7 +1051,8 @@ async def cb_flowcancel(call: CallbackQuery, state: FSMContext, bot: Bot):
 @router.callback_query(F.data.startswith("buy:"))
 async def cb_buy(call: CallbackQuery, state: FSMContext, bot: Bot):
     code = call.data.split(":", 1)[1]
-    if code not in PRODUCTS:
+    meta = product_meta(code)
+    if meta is None:
         await call.answer("❌ প্রোডাক্ট পাওয়া যায়নি।", show_alert=True)
         return
     pending = get_pending_order(call.from_user.id)
@@ -1011,7 +1075,7 @@ async def cb_buy(call: CallbackQuery, state: FSMContext, bot: Bot):
     await safe_send(
         bot,
         call.from_user.id,
-        f"🛒 <b>{esc(PRODUCTS[code]['name'])}</b>\n\n"
+        f"🛒 <b>{esc(meta['name'])}</b>\n\n"
         f"💰 প্রাইস: {fmt_money(product['price'])} TK\n"
         f"স্টক: {stock}\n\n"
         "পরিমাণ লিখুন:",
@@ -1023,7 +1087,7 @@ async def cb_buy(call: CallbackQuery, state: FSMContext, bot: Bot):
 async def got_quantity(message: Message, state: FSMContext):
     data = await state.get_data()
     code = data.get("code")
-    if code not in PRODUCTS or state_expired(data, PENDING_TTL):
+    if not code or product_meta(code) is None or state_expired(data, PENDING_TTL):
         await state.clear()
         await message.answer("⌛ সময় শেষ হয়ে গেছে। আবার শুরু করুন।", reply_markup=main_menu())
         return
@@ -1050,6 +1114,22 @@ async def got_quantity(message: Message, state: FSMContext):
     await state.clear()
     order = get_order(order_id)
     await message.answer(order_summary_text(order), reply_markup=order_kb(order_id))
+
+
+@router.callback_query(F.data == "vpnlist")
+async def cb_vpn_list(call: CallbackQuery, bot: Bot):
+    vpns = list_vpns()
+    if not vpns:
+        await call.answer("❌ এখন কোনো VPN নেই।", show_alert=True)
+        return
+    await call.answer()
+    rows = [[ibtn(vpn_label(v), f"buy:{VPN_PREFIX}{v['id']}", style="primary")] for v in vpns]
+    await safe_send(
+        bot,
+        call.from_user.id,
+        "🛡️ <b>VPN Store</b>\n\nআপনার VPN বেছে নিন:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
 @router.callback_query(F.data.regexp(r"^cfm:\d+$"))
@@ -1108,7 +1188,7 @@ async def deliver_order(bot: Bot, order_id: int) -> bool:
     accounts = get_order_accounts(order_id)
     if not accounts:
         return False
-    meta = PRODUCTS.get(order["product_code"], {"name": order["product_code"]})
+    meta = product_meta(order["product_code"]) or {"name": order["product_code"]}
     caption = (
         "🎉 <b>ডেলিভারি সম্পন্ন!</b>\n\n"
         f"🧾 Order No: <code>#{order_id}</code>\n"
@@ -1425,7 +1505,7 @@ async def add_get_amount(message: Message, state: FSMContext, bot: Bot):
 # --------------------------------------------------------------------------- #
 @router.callback_query(F.data.regexp(r"^acc:(meta_ai|meta_horizon)$"))
 async def cb_account_select(call: CallbackQuery, state: FSMContext, bot: Bot):
-    if not is_admin(call.from_user.id):
+    if not is_stock_admin(call.from_user.id):
         await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
         return
     code = call.data.split(":", 1)[1]
@@ -1462,7 +1542,7 @@ def parse_workbook(raw: bytes) -> dict:
         if first is None:
             return {"error": "empty"}
         # Header row is optional: skip it only if A1="Email" and B1="Password"
-        has_header = len(first) >= 2 and _norm(first[0]) == "email" and _norm(first[1]) == "password"
+        has_header = len(first) >= 2 and _norm(first[0]) in ("email", "username") and _norm(first[1]) == "password"
         start = 2 if has_header else 1
         if not has_header:
             rows = itertools.chain([first], rows)
@@ -1544,6 +1624,153 @@ async def admin_upload_file(message: Message, state: FSMContext, bot: Bot):
         f"✅ সফলভাবে ইমপোর্ট: {imported}\n"
         f"♻️ ডুপ্লিকেট স্কিপ: {dup_total}\n"
         f"⚠️ ইনভ্যালিড স্কিপ: {len(invalid)}{invalid_note}\n"
+        f"📦 আপডেটেড স্টক: {get_stock(code)}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Admin: /vpn
+# --------------------------------------------------------------------------- #
+VPN_FILE_PROMPT = (
+    "📤 এখন XLSX ফাইল পাঠান।\n\n"
+    "<b>Format:</b>\n"
+    "A কলাম: Email অথবা Username\n"
+    "B কলাম: Password\n"
+    "<i>(হেডার থাকা ঐচ্ছিক)</i>"
+)
+
+
+@router.message(Command("vpn"))
+async def cmd_vpn(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await message.answer("⛔ এই কমান্ড আপনার জন্য নয়।")
+        return
+    await state.clear()
+    await state.set_state(AdminVpn.name)
+    await message.answer("🛡️ VPN এর নাম দিন:", reply_markup=cancel_flow_kb())
+
+
+@router.message(AdminVpn.name, F.text, not_command)
+async def vpn_get_name(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await state.clear()
+        return
+    name = " ".join((message.text or "").split())
+    if not name or len(name) > 40:
+        await message.answer("❌ সঠিক নাম দিন (সর্বোচ্চ ৪০ অক্ষর)।")
+        return
+    existing = get_vpn_by_name(name)
+    if existing:
+        await state.update_data(code=f"{VPN_PREFIX}{existing['id']}", ts=time.time())
+        await state.set_state(AdminVpn.file)
+        await message.answer(
+            f"♻️ <b>{esc(existing['name'])}</b> আগে থেকেই আছে। এর স্টকে নতুন অ্যাকাউন্ট যোগ হবে।\n\n"
+            + VPN_FILE_PROMPT,
+            reply_markup=cancel_flow_kb(),
+        )
+        return
+    await state.update_data(name=name)
+    await state.set_state(AdminVpn.days)
+    await message.answer("⌛ এই VPN কত দিনের জন্য থাকবে? (দিন লিখুন, যেমন: 30)", reply_markup=cancel_flow_kb())
+
+
+@router.message(AdminVpn.days, F.text, not_command)
+async def vpn_get_days(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await state.clear()
+        return
+    days = parse_positive_int(message.text, 4)
+    if days is None:
+        await message.answer("❌ সঠিক দিন লিখুন (শুধু সংখ্যা, যেমন: 30)।")
+        return
+    await state.update_data(days=days)
+    await state.set_state(AdminVpn.price)
+    await message.answer("💰 এই VPN এর প্রাইস কত? (BDT, যেমন: 50)", reply_markup=cancel_flow_kb())
+
+
+@router.message(AdminVpn.price, F.text, not_command)
+async def vpn_get_price(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await state.clear()
+        return
+    price = parse_amount(message.text)
+    if price is None:
+        await message.answer("❌ সঠিক প্রাইস লিখুন (ধনাত্মক সংখ্যা, সর্বোচ্চ ২ দশমিক ঘর)।")
+        return
+    await state.update_data(price=price)
+    await state.set_state(AdminVpn.file)
+    await message.answer(VPN_FILE_PROMPT, reply_markup=cancel_flow_kb())
+
+
+@router.message(AdminVpn.file, F.document)
+async def vpn_upload_file(message: Message, state: FSMContext, bot: Bot):
+    if not is_stock_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".xlsx"):
+        await message.answer("❌ শুধু .xlsx ফাইল পাঠান।")
+        return
+    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
+        await message.answer(f"❌ ফাইল অনেক বড়। সর্বোচ্চ {MAX_UPLOAD_BYTES // (1024 * 1024)} MB।")
+        return
+    buf = io.BytesIO()
+    try:
+        await bot.download(doc, destination=buf)
+    except TelegramAPIError:
+        await message.answer("❌ ফাইল ডাউনলোড করা যায়নি। আবার পাঠান।")
+        return
+    raw = buf.getvalue()
+    if len(raw) > MAX_UPLOAD_BYTES or not raw.startswith(b"PK"):
+        await message.answer("❌ এটি বৈধ XLSX ফাইল নয়।")
+        return
+    try:
+        parsed = await asyncio.to_thread(parse_workbook, raw)
+    except Exception:
+        await message.answer("❌ ফাইলটি পড়া যায়নি। বৈধ XLSX ফাইল পাঠান।")
+        return
+    if "error" in parsed:
+        if parsed["error"] == "empty":
+            await message.answer("❌ ফাইলটি খালি। কলাম A তে Email/Username এবং কলাম B তে Password দিন।")
+        else:
+            await message.answer(f"❌ সর্বোচ্চ {MAX_XLSX_ROWS} সারি অনুমোদিত।")
+        return
+    if not parsed["valid"]:
+        await message.answer("❌ কোনো বৈধ সারি পাওয়া যায়নি। ফাইল ঠিক করে আবার পাঠান।")
+        return
+
+    # Create the VPN only now, so a cancelled flow never leaves an empty VPN in the shop.
+    code = data.get("code")
+    if code:
+        vpn = get_vpn_by_code(code)
+    else:
+        name, days, price = data.get("name"), data.get("days"), data.get("price")
+        if not (name and isinstance(days, int) and isinstance(price, int)):
+            await state.clear()
+            await message.answer("❌ কিছু ভুল হয়েছে। /vpn দিয়ে আবার শুরু করুন।")
+            return
+        vpn = get_vpn_by_name(name)
+        if vpn is None:
+            code = create_vpn(name, days, price)
+            vpn = get_vpn_by_code(code)
+    if vpn is None:
+        await state.clear()
+        await message.answer("❌ VPN পাওয়া যায়নি। /vpn দিয়ে আবার শুরু করুন।")
+        return
+    code = f"{VPN_PREFIX}{vpn['id']}"
+
+    imported = await asyncio.to_thread(import_accounts, code, parsed["valid"])
+    await state.clear()
+    dup_total = parsed["dup_file"] + (len(parsed["valid"]) - imported)
+    await message.answer(
+        f"📊 <b>VPN স্টক আপডেট — {esc(vpn['name'])}</b>\n\n"
+        f"⌛ মেয়াদ: {vpn['days']} Days\n"
+        f"💰 প্রাইস: {fmt_money(vpn['price'])} TK\n\n"
+        f"📄 মোট সারি প্রসেস: {parsed['total']}\n"
+        f"✅ সফলভাবে ইমপোর্ট: {imported}\n"
+        f"♻️ ডুপ্লিকেট স্কিপ: {dup_total}\n"
+        f"⚠️ ইনভ্যালিড স্কিপ: {len(parsed['invalid'])}\n"
         f"📦 আপডেটেড স্টক: {get_stock(code)}"
     )
 
