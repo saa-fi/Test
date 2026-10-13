@@ -78,7 +78,7 @@ def resolve_db_path() -> str:
 
 DB_PATH = resolve_db_path()
 
-SUPPORT_URL = "https://t.me/suppor9287"
+SUPPORT_URL = "https://t.me/team_passivpay_nexa"
 BKASH_NUMBER = "01533235544"
 NAGAD_NUMBER = "01533235544"
 BINANCE_UID = "1019679566"
