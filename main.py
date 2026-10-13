@@ -810,6 +810,15 @@ def order_kb(order_id: int) -> InlineKeyboardMarkup:
 
 
 def products_kb() -> InlineKeyboardMarkup:
+    """Shop Now: two buttons - Meta AI (admin-added products) and VPN."""
+    return ikb(
+        [ibtn("𝗠𝗲𝘁𝗮 𝗔𝗜 🤖", "metalist", style="primary")],
+        [ibtn("VPN 🛡️", "vpnlist", style="primary")],
+    )
+
+
+def meta_products_kb() -> InlineKeyboardMarkup:
+    """Products inside Meta AI: everything the admin added with /product."""
     rows = []
     for code, meta in PRODUCTS.items():
         product = get_product(code)
@@ -831,7 +840,6 @@ def products_kb() -> InlineKeyboardMarkup:
                 style="primary",
             )
         ])
-    rows.append([ibtn("VPN 🛡️", "vpnlist", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1222,6 +1230,23 @@ async def got_quantity(message: Message, state: FSMContext):
     await state.clear()
     order = get_order(order_id)
     await message.answer(order_summary_text(order), reply_markup=order_kb(order_id))
+
+
+@router.callback_query(F.data == "metalist")
+async def cb_meta_list(call: CallbackQuery, bot: Bot):
+    kb = meta_products_kb()
+    if not kb.inline_keyboard:
+        await call.answer("❌ এখন কোনো প্রোডাক্ট নেই।", show_alert=True)
+        return
+    await call.answer()
+    await safe_send(
+        bot,
+        call.from_user.id,
+        "🤖 <b>Meta AI Store</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "আপনার প্রোডাক্ট বেছে নিন:",
+        reply_markup=kb,
+    )
 
 
 @router.callback_query(F.data == "vpnlist")
