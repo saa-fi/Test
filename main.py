@@ -715,6 +715,7 @@ def do_purchase(order_id: int, user_id: int) -> dict:
         }
         for account_id, account in picked:
             updates[f"stock/{code}/{account_id}"] = None
+            updates[f"account_keys/{code}/{_hash(account['email'])}"] = None  # free email for re-import after sale
             updates[f"order_accounts/{order_id}/{account_id}"] = {
                 "email": account["email"], "password": account["password"],
             }
@@ -1078,7 +1079,7 @@ async def cmd_add(message: Message, state: FSMContext):
 
 @router.message(Command("account", ignore_case=True))
 async def cmd_account(message: Message, state: FSMContext):
-    if not is_stock_admin(message.from_user.id):
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ আপনি অ্যাডমিন নন।")
         return
     await state.clear()
@@ -1645,7 +1646,7 @@ async def add_get_amount(message: Message, state: FSMContext, bot: Bot):
 # --------------------------------------------------------------------------- #
 @router.callback_query(F.data.regexp(r"^acc:[A-Za-z0-9_]+$"))
 async def cb_account_select(call: CallbackQuery, state: FSMContext, bot: Bot):
-    if not is_stock_admin(call.from_user.id):
+    if not is_admin(call.from_user.id):
         await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
         return
     code = call.data.split(":", 1)[1]
