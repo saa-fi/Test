@@ -195,8 +195,7 @@ def parse_positive_int(text: str, max_digits: int = 6) -> Optional[int]:
 
 
 def mfs_is_open() -> bool:
-    current = datetime.now(DHAKA).time()
-    return dtime(9, 0) <= current < dtime(23, 0)
+    return True  # bKash / Nagad deposits are open 24/7
 
 
 def is_admin(user_id: Optional[int]) -> bool:
@@ -988,8 +987,7 @@ async def menu_deposit(message: Message, state: FSMContext):
     )
     await message.answer(
         "➕ <b>Add Funds</b>\n\nপেমেন্ট মেথড বেছে নিন:\n\n"
-        "ℹ️ bKash ও Nagad প্রতিদিন সকাল ০৯:০০ থেকে রাত ১১:০০ পর্যন্ত চালু থাকে। "
-        "Binance Pay চালু থাকে ২৪/৭।",
+        "ℹ️ bKash, Nagad ও Binance Pay সব মেথড ২৪/৭ চালু থাকে।",
         reply_markup=kb,
     )
 
