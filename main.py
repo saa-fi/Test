@@ -107,22 +107,25 @@ log = logging.getLogger("quest_sell_bot")
 # --------------------------------------------------------------------------- #
 # Catalog
 # --------------------------------------------------------------------------- #
-PRODUCTS = {
-    "meta_ai": {
-        "name": "Meta AI Account",
-        "label": "𝗠𝗲𝘁𝗮 𝗔𝗜 𝗔𝗰𝗰𝗼𝘂𝗻𝘁",
-        "title": "Meta AI ID",
-        "admin_label": "Meta Account",
-        "price": 50,
-    },
-    "meta_horizon": {
-        "name": "Meta Horizon",
-        "label": "𝗠𝗲𝘁𝗮 𝗛𝗼𝗿𝗶𝘇𝗼𝗻",
-        "title": "Meta Horizon",
-        "admin_label": "Meta Horizon",
-        "price": 55,
-    },
-}
+# Meta AI / Meta Horizon are disabled. Products are now added by the admin with /product.
+PRODUCTS: dict = {}
+# To re-enable the old fixed products, restore this block as PRODUCTS = {...}:
+# PRODUCTS = {
+#     "meta_ai": {
+#         "name": "Meta AI Account",
+#         "label": "𝗠𝗲𝘁𝗮 𝗔𝗜 𝗔𝗰𝗰𝗼𝘂𝗻𝘁",
+#         "title": "Meta AI ID",
+#         "admin_label": "Meta Account",
+#         "price": 50,
+#     },
+#     "meta_horizon": {
+#         "name": "Meta Horizon",
+#         "label": "𝗠𝗲𝘁𝗮 𝗛𝗼𝗿𝗶𝘇𝗼𝗻",
+#         "title": "Meta Horizon",
+#         "admin_label": "Meta Horizon",
+#         "price": 55,
+#     },
+# }
 
 METHODS = {
     "bkash": {"name": "bKash", "mfs": True},
@@ -438,6 +441,7 @@ def get_product(code: str):
 
 
 VPN_PREFIX = "vpn_"
+CUSTOM_PREFIX = "p_"  # products added by the admin with /product
 
 
 def _vpn_row(vpn_id, d: dict) -> dict:
@@ -479,6 +483,41 @@ def create_vpn(name: str, days: int, price: int) -> str:
         return code
 
 
+def list_custom_products() -> list:
+    rows = []
+    for k, v in _items(_ref("products").get()):
+        if k.startswith(CUSTOM_PREFIX) and k[len(CUSTOM_PREFIX):].isdigit():
+            rows.append({"code": k, "name": "", "price": 0, "active": 1, **v})
+    return sorted(rows, key=lambda r: int(r["code"][len(CUSTOM_PREFIX):]))
+
+
+def get_custom_product_by_name(name: str):
+    wanted = name.lower()
+    for row in list_custom_products():
+        if row["name"].lower() == wanted:
+            return row
+    return None
+
+
+def create_custom_product(name: str, price: int) -> str:
+    """Create an admin-added product (shown in Shop Now). Returns its code."""
+    with _lock:
+        if get_custom_product_by_name(name):
+            raise ValueError("product name already exists")
+        code = f"{CUSTOM_PREFIX}{_next_id('custom_products')}"
+        _ref(f"products/{code}").set({"code": code, "name": name, "price": price, "active": 1})
+        return code
+
+
+def is_stockable_product(code) -> bool:
+    """Products that /account can add stock to (VPNs are managed with /vpn)."""
+    if not isinstance(code, str):
+        return False
+    if code in PRODUCTS:
+        return True
+    return code.startswith(CUSTOM_PREFIX) and get_product(code) is not None
+
+
 def product_meta(code: str) -> Optional[dict]:
     meta = PRODUCTS.get(code)
     if meta:
@@ -486,6 +525,11 @@ def product_meta(code: str) -> Optional[dict]:
     vpn = get_vpn_by_code(code)
     if vpn:
         return {"name": f"{vpn['name']} ({vpn['days']} Days)", "title": f"{vpn['name']} ({vpn['days']} Days)"}
+    if code.startswith(CUSTOM_PREFIX):
+        product = get_product(code)
+        if product:
+            name = product["name"]
+            return {"name": name, "title": name, "label": name, "admin_label": name}
     return None
 
 
@@ -749,6 +793,17 @@ def products_kb() -> InlineKeyboardMarkup:
                 style="primary",
             )
         ])
+    for product in list_custom_products():
+        if not product["active"]:
+            continue
+        code = product["code"]
+        rows.append([
+            ibtn(
+                f"{product['name']} | {price_short(product['price'])} BDT | Stock: {get_stock(code)}",
+                f"buy:{code}",
+                style="primary",
+            )
+        ])
     rows.append([ibtn("VPN 🛡️", "vpnlist", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -857,6 +912,11 @@ class AdminUpload(StatesGroup):
 
 class AdminPrice(StatesGroup):
     amount = State()
+
+
+class AdminProduct(StatesGroup):
+    name = State()
+    price = State()
 
 
 class AdminVpn(StatesGroup):
@@ -987,6 +1047,10 @@ async def cmd_account(message: Message, state: FSMContext):
         return
     await state.clear()
     rows = [[ibtn(meta["admin_label"], f"acc:{code}", style="primary")] for code, meta in PRODUCTS.items()]
+    rows += [[ibtn(p["name"], f"acc:{p['code']}", style="primary")] for p in list_custom_products()]
+    if not rows:
+        await message.answer("❌ এখনো কোনো প্রোডাক্ট নেই। /product দিয়ে নতুন প্রোডাক্ট যোগ করুন।")
+        return
     await message.answer("📦 Select Products", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -1402,7 +1466,10 @@ async def notify_admins_deposit(bot: Bot, dep_id: int) -> None:
         ibtn("✅ Confirm Deposit", f"dep:ok:{dep_id}", style="success"),
         ibtn("❌ Cancel", f"dep:no:{dep_id}", style="danger"),
     ])
-    for admin_id in ADMIN_IDS:
+    targets = [a for a in ADMIN_IDS if is_stock_admin(a)]  # primary admin never gets deposit requests
+    if not targets:
+        log.warning("No second admin (ADMIN_ID) set - deposit request %s was not sent to anyone.", dep_id)
+    for admin_id in targets:
         sent = await safe_send(bot, admin_id, text, reply_markup=kb)
         if sent:
             save_deposit_msg(dep_id, admin_id, sent.message_id)
@@ -1410,7 +1477,7 @@ async def notify_admins_deposit(bot: Bot, dep_id: int) -> None:
 
 @router.callback_query(F.data.regexp(r"^dep:(ok|no):\d+$"))
 async def cb_admin_deposit(call: CallbackQuery, bot: Bot):
-    if not is_admin(call.from_user.id):
+    if not is_stock_admin(call.from_user.id):
         await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
         return
     _, action, raw_id = call.data.split(":")
@@ -1523,12 +1590,15 @@ async def add_get_amount(message: Message, state: FSMContext, bot: Bot):
 # --------------------------------------------------------------------------- #
 # Admin: /Account (XLSX stock import)
 # --------------------------------------------------------------------------- #
-@router.callback_query(F.data.regexp(r"^acc:(meta_ai|meta_horizon)$"))
+@router.callback_query(F.data.regexp(r"^acc:[A-Za-z0-9_]+$"))
 async def cb_account_select(call: CallbackQuery, state: FSMContext, bot: Bot):
     if not is_stock_admin(call.from_user.id):
         await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
         return
     code = call.data.split(":", 1)[1]
+    if not is_stockable_product(code):
+        await call.answer("❌ প্রোডাক্ট পাওয়া যায়নি।", show_alert=True)
+        return
     await call.answer()
     await state.clear()
     await state.set_state(AdminUpload.file)
@@ -1536,7 +1606,7 @@ async def cb_account_select(call: CallbackQuery, state: FSMContext, bot: Bot):
     await safe_send(
         bot,
         call.from_user.id,
-        f"📤 Send your XLSX file.\n\n<i>{esc(PRODUCTS[code]['name'])} — Column A: Email, Column B: Password (হেডার থাকা ঐচ্ছিক)</i>",
+        f"📤 Send your XLSX file.\n\n<i>{esc(product_meta(code)['name'])} — Column A: Email, Column B: Password (হেডার থাকা ঐচ্ছিক)</i>",
         reply_markup=cancel_flow_kb(),
     )
 
@@ -1597,7 +1667,7 @@ async def admin_upload_file(message: Message, state: FSMContext, bot: Bot):
         return
     data = await state.get_data()
     code = data.get("code")
-    if code not in PRODUCTS:
+    if not is_stockable_product(code):
         await state.clear()
         await message.answer("❌ কিছু ভুল হয়েছে। /Account দিয়ে আবার শুরু করুন।")
         return
@@ -1639,7 +1709,7 @@ async def admin_upload_file(message: Message, state: FSMContext, bot: Bot):
         more = f" ... (+{len(invalid) - 20})" if len(invalid) > 20 else ""
         invalid_note = f"\n   সারি নম্বর: {shown}{more}"
     await message.answer(
-        f"📊 <b>ইমপোর্ট সামারি — {esc(PRODUCTS[code]['name'])}</b>\n\n"
+        f"📊 <b>ইমপোর্ট সামারি — {esc(product_meta(code)['name'])}</b>\n\n"
         f"📄 মোট সারি প্রসেস: {parsed['total']}\n"
         f"✅ সফলভাবে ইমপোর্ট: {imported}\n"
         f"♻️ ডুপ্লিকেট স্কিপ: {dup_total}\n"
@@ -1658,16 +1728,23 @@ async def cmd_price(message: Message, state: FSMContext):
         return
     await state.clear()
     rows = [[ibtn(meta["admin_label"], f"prc:{code}", style="primary")] for code, meta in PRODUCTS.items()]
+    rows += [[ibtn(p["name"], f"prc:{p['code']}", style="primary")] for p in list_custom_products()]
+    if not rows:
+        await message.answer("❌ এখনো কোনো প্রোডাক্ট নেই। /product দিয়ে নতুন প্রোডাক্ট যোগ করুন।")
+        return
     await message.answer("💰 Select a product to set price:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
-@router.callback_query(F.data.regexp(r"^prc:(meta_ai|meta_horizon)$"))
+@router.callback_query(F.data.regexp(r"^prc:[A-Za-z0-9_]+$"))
 async def cb_price_select(call: CallbackQuery, state: FSMContext, bot: Bot):
     if not is_stock_admin(call.from_user.id):
         await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
         return
     code = call.data.split(":", 1)[1]
     product = get_product(code)
+    if not is_stockable_product(code) or product is None:
+        await call.answer("❌ প্রোডাক্ট পাওয়া যায়নি।", show_alert=True)
+        return
     await call.answer()
     await state.clear()
     await state.set_state(AdminPrice.amount)
@@ -1675,7 +1752,7 @@ async def cb_price_select(call: CallbackQuery, state: FSMContext, bot: Bot):
     await safe_send(
         bot,
         call.from_user.id,
-        f"💰 <b>{esc(PRODUCTS[code]['name'])}</b>\n"
+        f"💰 <b>{esc(product_meta(code)['name'])}</b>\n"
         f"বর্তমান প্রাইস: {fmt_money(product['price'])} TK\n\n"
         "নতুন প্রাইস দিন (BDT, যেমন: 50 বা 12.50):",
         reply_markup=cancel_flow_kb(),
@@ -1694,12 +1771,70 @@ async def price_get_amount(message: Message, state: FSMContext):
         await message.answer("❌ সঠিক প্রাইস লিখুন (ধনাত্মক সংখ্যা, সর্বোচ্চ ২ দশমিক ঘর)।")
         return
     await state.clear()
-    if code not in PRODUCTS:
+    if not is_stockable_product(code):
         await message.answer("❌ কিছু ভুল হয়েছে। /price দিয়ে আবার শুরু করুন।")
         return
     set_product_price(code, price)
     await message.answer(
-        f"✅ <b>{esc(PRODUCTS[code]['name'])}</b> এর প্রাইস সেট হয়েছে: {fmt_money(price)} TK"
+        f"✅ <b>{esc(product_meta(code)['name'])}</b> এর প্রাইস সেট হয়েছে: {fmt_money(price)} TK"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Admin: /product (add a new product to Shop Now)
+# --------------------------------------------------------------------------- #
+@router.message(Command("product"))
+async def cmd_product(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await message.answer("⛔ এই কমান্ড আপনার জন্য নয়।")
+        return
+    await state.clear()
+    await state.set_state(AdminProduct.name)
+    await message.answer("🛍️ প্রোডাক্টের নাম দিন:", reply_markup=cancel_flow_kb())
+
+
+@router.message(AdminProduct.name, F.text, not_command)
+async def product_get_name(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await state.clear()
+        return
+    name = " ".join((message.text or "").split())
+    if not name or len(name) > 40:
+        await message.answer("❌ সঠিক নাম দিন (সর্বোচ্চ ৪০ অক্ষর)।")
+        return
+    if get_custom_product_by_name(name):
+        await message.answer("❌ এই নামে প্রোডাক্ট আগে থেকেই আছে। অন্য নাম দিন।")
+        return
+    await state.update_data(name=name)
+    await state.set_state(AdminProduct.price)
+    await message.answer("💰 প্রোডাক্টের প্রাইস কত দিবেন? (BDT, যেমন: 50 বা 12.50)", reply_markup=cancel_flow_kb())
+
+
+@router.message(AdminProduct.price, F.text, not_command)
+async def product_get_price(message: Message, state: FSMContext):
+    if not is_stock_admin(message.from_user.id):
+        await state.clear()
+        return
+    price = parse_amount(message.text)
+    if price is None:
+        await message.answer("❌ সঠিক প্রাইস লিখুন (ধনাত্মক সংখ্যা, সর্বোচ্চ ২ দশমিক ঘর)।")
+        return
+    data = await state.get_data()
+    name = data.get("name")
+    await state.clear()
+    if not name:
+        await message.answer("❌ কিছু ভুল হয়েছে। /product দিয়ে আবার শুরু করুন।")
+        return
+    try:
+        create_custom_product(name, price)
+    except ValueError:
+        await message.answer("❌ এই নামে প্রোডাক্ট আগে থেকেই আছে। /product দিয়ে আবার শুরু করুন।")
+        return
+    await message.answer(
+        f"✅ <b>{esc(name)}</b> যোগ হয়েছে।\n"
+        f"💰 প্রাইস: {fmt_money(price)} TK\n\n"
+        "🛍️ Shop Now এ ইউজাররা এখন এই প্রোডাক্ট দেখতে পাবে।\n"
+        "📦 স্টক যোগ করতে /account দিন।"
     )
 
 
