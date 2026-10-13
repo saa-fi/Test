@@ -942,7 +942,8 @@ class AdminAdd(StatesGroup):
 
 
 class AdminUpload(StatesGroup):
-    file = State()
+    email = State()
+    password = State()
 
 
 class AdminPrice(StatesGroup):
@@ -1653,12 +1654,12 @@ async def cb_account_select(call: CallbackQuery, state: FSMContext, bot: Bot):
         return
     await call.answer()
     await state.clear()
-    await state.set_state(AdminUpload.file)
+    await state.set_state(AdminUpload.email)
     await state.update_data(code=code)
     await safe_send(
         bot,
         call.from_user.id,
-        f"📤 Send your XLSX file.\n\n<i>{esc(product_meta(code)['name'])} — Column A: Email, Column B: Password (হেডার থাকা ঐচ্ছিক)</i>",
+        f"📤 Send Email TXT file.\n\n<i>{esc(product_meta(code)['name'])} — প্রতি লাইনে একটি করে Email</i>",
         reply_markup=cancel_flow_kb(),
     )
 
@@ -1712,8 +1713,35 @@ def parse_workbook(raw: bytes) -> dict:
         wb.close()
 
 
-@router.message(AdminUpload.file, F.document)
-async def admin_upload_file(message: Message, state: FSMContext, bot: Bot):
+def parse_txt_lines(raw: bytes) -> list:
+    text = raw.decode("utf-8-sig", errors="ignore")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+async def _download_txt(message: Message, bot: Bot) -> Optional[bytes]:
+    """Validate + download a .txt document the admin sent. Returns raw bytes, or None (error already sent)."""
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".txt"):
+        await message.answer("❌ শুধু .txt ফাইল পাঠান।")
+        return None
+    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
+        await message.answer(f"❌ ফাইল অনেক বড়। সর্বোচ্চ {MAX_UPLOAD_BYTES // (1024 * 1024)} MB।")
+        return None
+    buf = io.BytesIO()
+    try:
+        await bot.download(doc, destination=buf)
+    except TelegramAPIError:
+        await message.answer("❌ ফাইল ডাউনলোড করা যায়নি। আবার পাঠান।")
+        return None
+    raw = buf.getvalue()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        await message.answer("❌ ফাইলটি অনেক বড়।")
+        return None
+    return raw
+
+
+@router.message(AdminUpload.email, F.document)
+async def admin_upload_email_file(message: Message, state: FSMContext, bot: Bot):
     if not is_admin(message.from_user.id):
         await state.clear()
         return
@@ -1721,48 +1749,85 @@ async def admin_upload_file(message: Message, state: FSMContext, bot: Bot):
     code = data.get("code")
     if not is_stockable_product(code):
         await state.clear()
-        await message.answer("❌ কিছু ভুল হয়েছে। /Account দিয়ে আবার শুরু করুন।")
+        await message.answer("❌ কিছু ভুল হয়েছে। /account দিয়ে আবার শুরু করুন।")
         return
-    doc = message.document
-    if not (doc.file_name or "").lower().endswith(".xlsx"):
-        await message.answer("❌ শুধু .xlsx ফাইল পাঠান।")
-        return
-    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
-        await message.answer(f"❌ ফাইল অনেক বড়। সর্বোচ্চ {MAX_UPLOAD_BYTES // (1024 * 1024)} MB।")
-        return
-    buf = io.BytesIO()
-    try:
-        await bot.download(doc, destination=buf)
-    except TelegramAPIError:
-        await message.answer("❌ ফাইল ডাউনলোড করা যায়নি। আবার পাঠান।")
-        return
-    raw = buf.getvalue()
-    if len(raw) > MAX_UPLOAD_BYTES or not raw.startswith(b"PK"):
-        await message.answer("❌ এটি বৈধ XLSX ফাইল নয়।")
+    raw = await _download_txt(message, bot)
+    if raw is None:
         return
     try:
-        parsed = await asyncio.to_thread(parse_workbook, raw)
+        emails = await asyncio.to_thread(parse_txt_lines, raw)
     except Exception:
-        await message.answer("❌ ফাইলটি পড়া যায়নি। বৈধ XLSX ফাইল পাঠান।")
+        await message.answer("❌ ফাইলটি পড়া যায়নি। বৈধ TXT ফাইল পাঠান।")
         return
-    if "error" in parsed:
-        if parsed["error"] == "empty":
-            await message.answer("❌ ফাইলটি খালি। কলাম A তে Email এবং কলাম B তে Password দিন।")
-        else:
-            await message.answer(f"❌ সর্বোচ্চ {MAX_XLSX_ROWS} সারি অনুমোদিত।")
+    if not emails:
+        await message.answer("❌ ফাইলটি খালি। প্রতি লাইনে একটি করে Email দিন।")
         return
-    imported = await asyncio.to_thread(import_accounts, code, parsed["valid"])
-    dup_total = parsed["dup_file"] + (len(parsed["valid"]) - imported)
+    if len(emails) > MAX_XLSX_ROWS:
+        await message.answer(f"❌ সর্বোচ্চ {MAX_XLSX_ROWS} টি Email অনুমোদিত।")
+        return
+    await state.update_data(emails=emails)
+    await state.set_state(AdminUpload.password)
+    await message.answer(
+        f"✅ {len(emails)} টি Email পাওয়া গেছে।\n\n"
+        "📤 এখন Password TXT file পাঠান।\n"
+        "<i>প্রতি লাইনে একটি করে Password — Email এর সমান সংখ্যা ও ক্রমে</i>",
+        reply_markup=cancel_flow_kb(),
+    )
+
+
+@router.message(AdminUpload.password, F.document)
+async def admin_upload_password_file(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    code = data.get("code")
+    emails = data.get("emails")
+    if not is_stockable_product(code) or not emails:
+        await state.clear()
+        await message.answer("❌ কিছু ভুল হয়েছে। /account দিয়ে আবার শুরু করুন।")
+        return
+    raw = await _download_txt(message, bot)
+    if raw is None:
+        return
+    try:
+        passwords = await asyncio.to_thread(parse_txt_lines, raw)
+    except Exception:
+        await message.answer("❌ ফাইলটি পড়া যায়নি। বৈধ TXT ফাইল পাঠান।")
+        return
+    if not passwords:
+        await message.answer("❌ ফাইলটি খালি। প্রতি লাইনে একটি করে Password দিন।")
+        return
+    if len(passwords) != len(emails):
+        await message.answer(
+            f"❌ সংখ্যা মিলছে না: {len(emails)} টি Email কিন্তু {len(passwords)} টি Password।\n"
+            "সঠিক Password TXT file আবার পাঠান (Email এর সমান সংখ্যায়)।"
+        )
+        return
+
+    total = len(emails)
+    seen, dup, invalid, valid = set(), 0, [], []
+    for line_no, (email, password) in enumerate(zip(emails, passwords), start=1):
+        if not email or not password:
+            invalid.append(line_no)
+            continue
+        if email in seen:
+            dup += 1
+            continue
+        seen.add(email)
+        valid.append((email, password))
+
+    imported = await asyncio.to_thread(import_accounts, code, valid)
+    dup_total = dup + (len(valid) - imported)
     await state.clear()
-    invalid = parsed["invalid"]
     invalid_note = ""
     if invalid:
         shown = ", ".join(str(n) for n in invalid[:20])
         more = f" ... (+{len(invalid) - 20})" if len(invalid) > 20 else ""
-        invalid_note = f"\n   সারি নম্বর: {shown}{more}"
+        invalid_note = f"\n   লাইন নম্বর: {shown}{more}"
     await message.answer(
         f"📊 <b>ইমপোর্ট সামারি — {esc(product_meta(code)['name'])}</b>\n\n"
-        f"📄 মোট সারি প্রসেস: {parsed['total']}\n"
+        f"📄 মোট প্রসেস: {total}\n"
         f"✅ সফলভাবে ইমপোর্ট: {imported}\n"
         f"♻️ ডুপ্লিকেট স্কিপ: {dup_total}\n"
         f"⚠️ ইনভ্যালিড স্কিপ: {len(invalid)}{invalid_note}\n"
