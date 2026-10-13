@@ -700,7 +700,7 @@ def products_kb() -> InlineKeyboardMarkup:
 
 def vpn_label(vpn) -> str:
     code = f"{VPN_PREFIX}{vpn['id']}"
-    return f"🛡️ {vpn['name']} | ⌛ {vpn['days']} Days | {price_short(vpn['price'])} BDT | Stock: {get_stock(code)}"
+    return f"🛡️ {vpn['name']} | ⌛ {vpn['days']} Days | {price_short(vpn['price'])} BDT | 📦 {get_stock(code)}"
 
 
 def deposit_admin_text(dep, user, note: Optional[str] = None) -> str:
@@ -1127,7 +1127,10 @@ async def cb_vpn_list(call: CallbackQuery, bot: Bot):
     await safe_send(
         bot,
         call.from_user.id,
-        "🛡️ <b>VPN Store</b>\n\nআপনার VPN বেছে নিন:",
+        "🛡️ <b>VPN Store</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "আপনার VPN বেছে নিন:\n"
+        "📦 = Stock",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
