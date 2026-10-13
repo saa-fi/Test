@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-NEXA STORE - automated digital-goods store for Telegram (aiogram 3.x + SQLite).
+NEXA STORE - automated digital-goods store for Telegram (aiogram 3.x + Firebase Realtime Database).
 
 Every reply-keyboard button and every inline-keyboard button is colored using the
 Telegram Bot API 9.4 `style` field ("primary" = blue, "success" = green, "danger" = red).
 """
 
 import asyncio
+import hashlib
 import html
 import io
 import itertools
+import json
 import logging
 import os
 import re
-import sqlite3
+import threading
 import time
-from contextlib import contextmanager
 from datetime import datetime, time as dtime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -45,7 +46,9 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     User,
 )
+import firebase_admin
 from dotenv import load_dotenv
+from firebase_admin import credentials, db as rtdb
 from openpyxl import Workbook, load_workbook
 
 # --------------------------------------------------------------------------- #
@@ -66,17 +69,8 @@ SECOND_ADMIN_ID = _second_admin()
 ADMIN_IDS = {PRIMARY_ADMIN_ID} | ({SECOND_ADMIN_ID} if SECOND_ADMIN_ID else set())
 
 
-def resolve_db_path() -> str:
-    explicit = os.getenv("DB_PATH", "").strip()
-    if explicit:
-        return explicit
-    volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-    if volume:
-        return os.path.join(volume, "quest_sell.db")
-    return "quest_sell.db"
-
-
-DB_PATH = resolve_db_path()
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "").strip()  # service-account JSON (or path to it)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # Firebase Realtime Database URL
 
 SUPPORT_URL = "https://t.me/team_passivpay_nexa"
 BKASH_NUMBER = "01533235544"
@@ -243,147 +237,138 @@ def cancel_flow_kb() -> InlineKeyboardMarkup:
 
 
 # --------------------------------------------------------------------------- #
-# Database
+# Database (Firebase Realtime Database)
 # --------------------------------------------------------------------------- #
-_db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-os.makedirs(_db_dir, exist_ok=True)
-
-db = sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False, timeout=30)
-db.row_factory = sqlite3.Row
+# Layout:
+#   users/{user_id}, products/{code}, vpns/{id}, orders/{id}, deposits/{id}
+#   settings/bot_enabled, counters/{name}
+#   stock/{code}/{account_id}        -> available accounts
+#   stock_count/{code}               -> number of available accounts
+#   account_keys/{code}/{sha1}       -> duplicate guard (code + email)
+#   order_accounts/{order_id}/{id}   -> accounts delivered for an order
+#   pending_orders/{order_id}, undelivered/{user_id}/{order_id}
+#   referrals/{referrer_id}/{user_id}, deposit_refs/{method}/{sha1}
+#   deposit_msgs/{deposit_id}/{push_key}
+_lock = threading.RLock()  # serialises read-modify-write sections (all DB calls are synchronous)
 
 
 class PurchaseError(Exception):
     pass
 
 
-@contextmanager
-def tx():
-    """Atomic transaction. All DB calls are synchronous, so no await can interleave inside."""
-    db.execute("BEGIN IMMEDIATE")
+def _init_firebase() -> None:
+    if not FIREBASE_CREDENTIALS:
+        raise SystemExit("FIREBASE_CREDENTIALS environment variable is not set.")
+    if not DATABASE_URL:
+        raise SystemExit("DATABASE_URL environment variable is not set.")
+    if FIREBASE_CREDENTIALS.startswith("{"):
+        info = json.loads(FIREBASE_CREDENTIALS, strict=False)
+        if isinstance(info.get("private_key"), str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        cred = credentials.Certificate(info)
+    else:  # path to a service-account JSON file
+        cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+    firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+
+
+def _ref(path: str):
+    return rtdb.reference(path)
+
+
+def _update(updates: dict) -> None:
+    """Atomic multi-path write (a None value deletes that path)."""
+    rtdb.reference("/").update(updates)
+
+
+def _items(val) -> list:
+    """Firebase returns integer-keyed nodes as lists; normalise to (key, value) pairs."""
+    if not val:
+        return []
+    if isinstance(val, list):
+        return [(str(i), v) for i, v in enumerate(val) if v is not None]
+    return [(str(k), v) for k, v in val.items()]
+
+
+def _keys(path: str) -> list:
+    ref = _ref(path)
     try:
-        yield db
-        db.execute("COMMIT")
-    except BaseException:
-        db.execute("ROLLBACK")
-        raise
+        val = ref.get(shallow=True)
+    except TypeError:  # very old firebase-admin without shallow reads
+        val = ref.get()
+    return [k for k, _ in _items(val)]
+
+
+def _next_id(name: str, count: int = 1) -> int:
+    """Atomically reserve `count` ids. Returns the last reserved id (ids start at 1)."""
+    return _ref(f"counters/{name}").transaction(lambda cur: (cur or 0) + count)
+
+
+def _hash(text) -> str:
+    return hashlib.sha1(str(text).encode("utf-8")).hexdigest()
+
+
+def _valid_code(code) -> bool:
+    return isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_]{1,64}", code) is not None
+
+
+def _clean(d: dict) -> dict:
+    return {k: v for k, v in d.items() if v is not None}
 
 
 def init_db() -> None:
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=NORMAL")
-    db.execute("PRAGMA foreign_keys=ON")
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
-            started INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS products (
-            code TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            price INTEGER NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_code TEXT NOT NULL,
-            email TEXT NOT NULL,
-            password TEXT NOT NULL,
-            available INTEGER NOT NULL DEFAULT 1,
-            order_id INTEGER,
-            UNIQUE (product_code, email)
-        );
-        CREATE INDEX IF NOT EXISTS idx_accounts_stock ON accounts (product_code, available);
-        CREATE INDEX IF NOT EXISTS idx_accounts_order ON accounts (order_id);
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            product_code TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            unit_price INTEGER NOT NULL,
-            total_price INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            delivered INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            created_ts INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_orders_user ON orders (user_id, status);
-        CREATE TABLE IF NOT EXISTS deposits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            method TEXT NOT NULL,
-            amount INTEGER NOT NULL,
-            reference TEXT NOT NULL,
-            status TEXT NOT NULL,
-            processed_by INTEGER,
-            created_at TEXT NOT NULL,
-            processed_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_deposits_ref ON deposits (method, reference);
-        CREATE TABLE IF NOT EXISTS deposit_msgs (
-            deposit_id INTEGER NOT NULL,
-            chat_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS vpns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            days INTEGER NOT NULL,
-            price INTEGER NOT NULL
-        );
-        """
-    )
+    _init_firebase()
     for code, meta in PRODUCTS.items():
-        db.execute(
-            "INSERT INTO products (code, name, price, active) VALUES (?, ?, ?, 1) "
-            "ON CONFLICT(code) DO UPDATE SET name=excluded.name",
-            (code, meta["name"], meta["price"]),
-        )
-    db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_enabled', '1')")
-    cols = [r["name"] for r in db.execute("PRAGMA table_info(users)").fetchall()]
-    if "referred_by" not in cols:
-        db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+        if _ref(f"products/{code}").get():
+            _ref(f"products/{code}/name").set(meta["name"])
+        else:
+            _ref(f"products/{code}").set(
+                {"code": code, "name": meta["name"], "price": meta["price"], "active": 1}
+            )
+    if _ref("settings/bot_enabled").get() is None:
+        _ref("settings/bot_enabled").set("1")
 
 
 # ---- settings ------------------------------------------------------------- #
 def is_enabled() -> bool:
-    row = db.execute("SELECT value FROM settings WHERE key='bot_enabled'").fetchone()
-    return row is None or row["value"] == "1"
+    val = _ref("settings/bot_enabled").get()
+    return val is None or str(val) == "1"
 
 
 def set_enabled(flag: bool) -> None:
-    db.execute(
-        "INSERT INTO settings (key, value) VALUES ('bot_enabled', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        ("1" if flag else "0",),
-    )
+    _ref("settings/bot_enabled").set("1" if flag else "0")
 
 
 # ---- users ---------------------------------------------------------------- #
+def _user_row(user_id: int, d: Optional[dict]) -> Optional[dict]:
+    if not d:
+        return None
+    return {
+        "user_id": user_id, "username": None, "full_name": "", "balance": 0,
+        "started": 0, "created_at": "", "referred_by": None, **d,
+    }
+
+
 def upsert_user(u: User) -> bool:
     """Insert/update a user. Returns True if this is the user's first time starting the bot."""
-    prev = db.execute("SELECT started FROM users WHERE user_id=?", (u.id,)).fetchone()
-    is_new = prev is None or not prev["started"]
-    db.execute(
-        "INSERT INTO users (user_id, username, full_name, balance, started, created_at) "
-        "VALUES (?, ?, ?, 0, 1, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
-        "full_name=excluded.full_name, started=1",
-        (u.id, u.username, u.full_name, now_iso()),
-    )
-    return is_new
+    with _lock:
+        prev = _ref(f"users/{u.id}").get()
+        is_new = not prev or not prev.get("started")
+        if prev:
+            _update({
+                f"users/{u.id}/username": u.username,
+                f"users/{u.id}/full_name": u.full_name,
+                f"users/{u.id}/started": 1,
+            })
+        else:
+            _ref(f"users/{u.id}").set(_clean({
+                "user_id": u.id, "username": u.username, "full_name": u.full_name,
+                "balance": 0, "started": 1, "created_at": now_iso(),
+            }))
+        return is_new
 
 
 def get_user(user_id: int):
-    return db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return _user_row(user_id, _ref(f"users/{user_id}").get())
 
 
 def get_balance(user_id: int) -> int:
@@ -392,14 +377,22 @@ def get_balance(user_id: int) -> int:
 
 
 def add_balance(user_id: int, amount: int) -> int:
-    with tx():
-        db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, full_name, balance, started, created_at) "
-            "VALUES (?, NULL, '', 0, 0, ?)",
-            (user_id, now_iso()),
-        )
-        db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-        return db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()["balance"]
+    with _lock:
+        user = _ref(f"users/{user_id}").get()
+        if user:
+            new_balance = int(user.get("balance", 0)) + amount
+            _update({f"users/{user_id}/balance": new_balance})
+        else:
+            new_balance = amount
+            _ref(f"users/{user_id}").set(
+                {"user_id": user_id, "full_name": "", "balance": new_balance,
+                 "started": 0, "created_at": now_iso()}
+            )
+        return new_balance
+
+
+def get_started_user_ids() -> list:
+    return [int(k) for k, v in _items(_ref("users").get()) if v.get("started")]
 
 
 # ---- referrals ------------------------------------------------------------ #
@@ -407,64 +400,75 @@ def register_referral(new_user_id: int, referrer_id: int) -> Optional[int]:
     """Credit the referrer once for a brand-new user. Returns referrer's new balance or None."""
     if new_user_id == referrer_id:
         return None
-    with tx():
-        ref = db.execute(
-            "SELECT started FROM users WHERE user_id=?", (referrer_id,)
-        ).fetchone()
-        if ref is None or not ref["started"]:
+    with _lock:
+        ref = _ref(f"users/{referrer_id}").get()
+        if not ref or not ref.get("started"):
             return None
-        cur = db.execute(
-            "UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL",
-            (referrer_id, new_user_id),
-        )
-        if cur.rowcount != 1:
+        new = _ref(f"users/{new_user_id}").get()
+        if not new or new.get("referred_by") is not None:
             return None
-        db.execute(
-            "UPDATE users SET balance = balance + ? WHERE user_id=?",
-            (REFERRAL_BONUS, referrer_id),
-        )
-        return db.execute(
-            "SELECT balance FROM users WHERE user_id=?", (referrer_id,)
-        ).fetchone()["balance"]
+        new_balance = int(ref.get("balance", 0)) + REFERRAL_BONUS
+        _update({
+            f"users/{new_user_id}/referred_by": referrer_id,
+            f"users/{referrer_id}/balance": new_balance,
+            f"referrals/{referrer_id}/{new_user_id}": True,
+        })
+        return new_balance
 
 
 def count_referrals(user_id: int) -> int:
-    return db.execute(
-        "SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user_id,)
-    ).fetchone()["c"]
+    return len(_keys(f"referrals/{user_id}"))
 
 
 # ---- products / stock ----------------------------------------------------- #
 def get_product(code: str):
-    return db.execute("SELECT * FROM products WHERE code=?", (code,)).fetchone()
+    if not _valid_code(code):
+        return None
+    d = _ref(f"products/{code}").get()
+    if not d:
+        return None
+    return {"code": code, "name": "", "price": 0, "active": 1, **d}
 
 
 VPN_PREFIX = "vpn_"
 
 
+def _vpn_row(vpn_id, d: dict) -> dict:
+    return {"name": "", "days": 0, "price": 0, **d, "id": int(vpn_id)}
+
+
+def list_vpns() -> list:
+    rows = [_vpn_row(k, v) for k, v in _items(_ref("vpns").get())]
+    return sorted(rows, key=lambda r: r["id"])
+
+
 def get_vpn_by_name(name: str):
-    return db.execute("SELECT * FROM vpns WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+    wanted = name.lower()
+    for row in list_vpns():
+        if row["name"].lower() == wanted:
+            return row
+    return None
 
 
 def get_vpn_by_code(code: str):
     if not code.startswith(VPN_PREFIX) or not code[len(VPN_PREFIX):].isdigit():
         return None
-    return db.execute("SELECT * FROM vpns WHERE id=?", (int(code[len(VPN_PREFIX):]),)).fetchone()
-
-
-def list_vpns() -> list:
-    return db.execute("SELECT * FROM vpns ORDER BY id").fetchall()
+    vpn_id = int(code[len(VPN_PREFIX):])
+    d = _ref(f"vpns/{vpn_id}").get()
+    return _vpn_row(vpn_id, d) if d else None
 
 
 def create_vpn(name: str, days: int, price: int) -> str:
     """Create a VPN (also registered as a product so the normal buy flow works). Returns its code."""
-    with tx():
-        cur = db.execute("INSERT INTO vpns (name, days, price) VALUES (?, ?, ?)", (name, days, price))
-        code = f"{VPN_PREFIX}{cur.lastrowid}"
-        db.execute(
-            "INSERT INTO products (code, name, price, active) VALUES (?, ?, ?, 1)",
-            (code, name, price),
-        )
+    with _lock:
+        if get_vpn_by_name(name):
+            raise ValueError("VPN name already exists")
+        vpn_id = _next_id("vpns")
+        code = f"{VPN_PREFIX}{vpn_id}"
+        _update({
+            f"vpns/{vpn_id}": {"id": vpn_id, "name": name, "days": days, "price": price},
+            f"products/{code}": {"code": code, "name": name, "price": price, "active": 1},
+        })
         return code
 
 
@@ -479,190 +483,231 @@ def product_meta(code: str) -> Optional[dict]:
 
 
 def set_product_price(code: str, price: int) -> None:
-    db.execute("UPDATE products SET price=? WHERE code=?", (price, code))
+    if get_product(code) is not None:
+        _ref(f"products/{code}/price").set(price)
+
+
+def _stock_count(code: str) -> int:
+    """Available accounts for a product (kept in stock_count; rebuilt from stock if missing)."""
+    val = _ref(f"stock_count/{code}").get()
+    if val is None:
+        val = len(_keys(f"stock/{code}"))
+        _ref(f"stock_count/{code}").set(val)
+    return int(val)
 
 
 def get_stock(code: str) -> int:
-    return db.execute(
-        "SELECT COUNT(*) AS c FROM accounts WHERE product_code=? AND available=1", (code,)
-    ).fetchone()["c"]
+    if not _valid_code(code):
+        return 0
+    return _stock_count(code)
 
 
 def import_accounts(code: str, rows: list) -> int:
-    imported = 0
-    with tx():
+    with _lock:
+        known = set(_keys(f"account_keys/{code}"))
+        fresh = []
         for email, password in rows:
-            cur = db.execute(
-                "INSERT OR IGNORE INTO accounts (product_code, email, password, available) "
-                "VALUES (?, ?, ?, 1)",
-                (code, email, password),
-            )
-            imported += cur.rowcount
-    return imported
+            h = _hash(email)
+            if h in known:
+                continue
+            known.add(h)
+            fresh.append((email, password, h))
+        if not fresh:
+            return 0
+        count = _stock_count(code)
+        first_id = _next_id("accounts", len(fresh)) - len(fresh) + 1
+        for start in range(0, len(fresh), 500):
+            chunk = fresh[start:start + 500]
+            updates = {}
+            for offset, (email, password, h) in enumerate(chunk, start):
+                account_id = first_id + offset
+                updates[f"stock/{code}/{account_id}"] = {"email": email, "password": password}
+                updates[f"account_keys/{code}/{h}"] = account_id
+            updates[f"stock_count/{code}"] = count + start + len(chunk)
+            _update(updates)
+        return len(fresh)
 
 
 def get_order_accounts(order_id: int) -> list:
-    rows = db.execute(
-        "SELECT email, password FROM accounts WHERE order_id=? ORDER BY id", (order_id,)
-    ).fetchall()
-    return [(r["email"], r["password"]) for r in rows]
+    items = sorted(_items(_ref(f"order_accounts/{order_id}").get()), key=lambda kv: int(kv[0]))
+    return [(v["email"], v["password"]) for _, v in items]
 
 
 # ---- orders --------------------------------------------------------------- #
-def expire_pending() -> None:
-    db.execute(
-        "UPDATE orders SET status='CANCELLED' WHERE status='PENDING' AND created_ts < ?",
-        (now_ts() - PENDING_TTL,),
-    )
+def expire_pending() -> list:
+    """Cancel timed-out pending orders. Returns the still-pending (order_id, info) pairs."""
+    with _lock:
+        cutoff = now_ts() - PENDING_TTL
+        updates, remaining = {}, []
+        for k, v in _items(_ref("pending_orders").get()):
+            if v.get("created_ts", 0) < cutoff:
+                updates[f"orders/{k}/status"] = "CANCELLED"
+                updates[f"pending_orders/{k}"] = None
+            else:
+                remaining.append((k, v))
+        if updates:
+            _update(updates)
+        return remaining
 
 
 def get_pending_order(user_id: int):
-    expire_pending()
-    return db.execute(
-        "SELECT * FROM orders WHERE user_id=? AND status='PENDING' ORDER BY id DESC LIMIT 1",
-        (user_id,),
-    ).fetchone()
+    mine = [int(k) for k, v in expire_pending() if v.get("user_id") == user_id]
+    return get_order(max(mine)) if mine else None
 
 
 def get_order(order_id: int):
-    return db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    d = _ref(f"orders/{order_id}").get()
+    return {"id": order_id, **d} if d else None
 
 
 def create_pending_order(user_id: int, code: str, quantity: int) -> int:
     product = get_product(code)
     unit = product["price"]
-    with tx():
-        cur = db.execute(
-            "INSERT INTO orders (user_id, product_code, quantity, unit_price, total_price, "
-            "status, delivered, created_at, created_ts) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)",
-            (user_id, code, quantity, unit, unit * quantity, now_iso(), now_ts()),
-        )
-        return cur.lastrowid
+    with _lock:
+        order_id = _next_id("orders")
+        ts = now_ts()
+        _update({
+            f"orders/{order_id}": {
+                "id": order_id, "user_id": user_id, "product_code": code, "quantity": quantity,
+                "unit_price": unit, "total_price": unit * quantity, "status": "PENDING",
+                "delivered": 0, "created_at": now_iso(), "created_ts": ts,
+            },
+            f"pending_orders/{order_id}": {"user_id": user_id, "created_ts": ts},
+        })
+        return order_id
 
 
 def cancel_order(order_id: int, user_id: int) -> bool:
-    with tx():
-        cur = db.execute(
-            "UPDATE orders SET status='CANCELLED' WHERE id=? AND user_id=? AND status='PENDING'",
-            (order_id, user_id),
-        )
-        return cur.rowcount == 1
+    with _lock:
+        order = get_order(order_id)
+        if order is None or order["user_id"] != user_id or order["status"] != "PENDING":
+            return False
+        _update({f"orders/{order_id}/status": "CANCELLED", f"pending_orders/{order_id}": None})
+        return True
+
+
+def get_undelivered_orders(user_id: int) -> list:
+    ids = sorted(int(k) for k in _keys(f"undelivered/{user_id}"))
+    return [{"id": i} for i in ids]
+
+
+def mark_delivered(order_id: int) -> None:
+    order = get_order(order_id)
+    if order is not None:
+        _update({
+            f"orders/{order_id}/delivered": 1,
+            f"undelivered/{order['user_id']}/{order_id}": None,
+        })
 
 
 def do_purchase(order_id: int, user_id: int) -> dict:
-    with tx():
-        order = db.execute(
-            "SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, user_id)
-        ).fetchone()
-        if order is None or order["status"] != "PENDING":
+    with _lock:
+        order = get_order(order_id)
+        if order is None or order["user_id"] != user_id or order["status"] != "PENDING":
             return {"status": "invalid"}
+        cancel = {f"orders/{order_id}/status": "CANCELLED", f"pending_orders/{order_id}": None}
         if order["created_ts"] < now_ts() - PENDING_TTL:
-            db.execute("UPDATE orders SET status='CANCELLED' WHERE id=?", (order_id,))
+            _update(cancel)
             return {"status": "expired"}
         product = get_product(order["product_code"])
         if product is None or not product["active"]:
-            db.execute("UPDATE orders SET status='CANCELLED' WHERE id=?", (order_id,))
+            _update(cancel)
             return {"status": "inactive"}
         total = order["total_price"]
         quantity = order["quantity"]
-        balance = db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
-        balance = balance["balance"] if balance else 0
+        code = order["product_code"]
+        user = _ref(f"users/{user_id}").get()
+        balance = int(user.get("balance", 0)) if user else 0
         if balance < total:
             return {"status": "balance", "need": total, "balance": balance}
-        picked = db.execute(
-            "SELECT id FROM accounts WHERE product_code=? AND available=1 ORDER BY id LIMIT ?",
-            (order["product_code"], quantity),
-        ).fetchall()
+        stock_count = _stock_count(code)
+        picked = sorted(
+            _items(_ref(f"stock/{code}").order_by_key().limit_to_first(quantity).get()),
+            key=lambda kv: int(kv[0]),
+        )
         if len(picked) < quantity:
-            db.execute("UPDATE orders SET status='CANCELLED' WHERE id=?", (order_id,))
+            _update(cancel)
             return {"status": "stock", "stock": len(picked)}
-        ids = [r["id"] for r in picked]
-        marks = ",".join("?" * len(ids))
-        cur = db.execute(
-            f"UPDATE accounts SET available=0, order_id=? WHERE available=1 AND id IN ({marks})",
-            (order_id, *ids),
-        )
-        if cur.rowcount != quantity:
-            raise PurchaseError("account reservation mismatch")
-        cur = db.execute(
-            "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?",
-            (total, user_id, total),
-        )
-        if cur.rowcount != 1:
-            raise PurchaseError("balance deduction failed")
-        cur = db.execute(
-            "UPDATE orders SET status='COMPLETED' WHERE id=? AND status='PENDING'", (order_id,)
-        )
-        if cur.rowcount != 1:
-            raise PurchaseError("order state changed")
+        updates = {
+            f"users/{user_id}/balance": balance - total,
+            f"orders/{order_id}/status": "COMPLETED",
+            f"pending_orders/{order_id}": None,
+            f"undelivered/{user_id}/{order_id}": True,
+            f"stock_count/{code}": stock_count - quantity,
+        }
+        for account_id, account in picked:
+            updates[f"stock/{code}/{account_id}"] = None
+            updates[f"order_accounts/{order_id}/{account_id}"] = {
+                "email": account["email"], "password": account["password"],
+            }
+        _update(updates)  # one atomic write: balance, order, stock and accounts together
         return {"status": "ok"}
 
 
 # ---- deposits ------------------------------------------------------------- #
+def _deposit_ref_path(method: str, reference: str) -> str:
+    return f"deposit_refs/{method}/{_hash(reference)}"
+
+
 def reference_exists(method: str, reference: str) -> bool:
-    row = db.execute(
-        "SELECT 1 FROM deposits WHERE method=? AND reference=? AND status IN ('PENDING','APPROVED')",
-        (method, reference),
-    ).fetchone()
-    return row is not None
+    return _ref(_deposit_ref_path(method, reference)).get() is not None
 
 
 def create_deposit(user_id: int, method: str, amount: int, reference: str) -> int:
-    with tx():
-        cur = db.execute(
-            "INSERT INTO deposits (user_id, method, amount, reference, status, created_at) "
-            "VALUES (?, ?, ?, ?, 'PENDING', ?)",
-            (user_id, method, amount, reference, now_iso()),
-        )
-        return cur.lastrowid
+    with _lock:
+        dep_id = _next_id("deposits")
+        _update({
+            f"deposits/{dep_id}": {
+                "id": dep_id, "user_id": user_id, "method": method, "amount": amount,
+                "reference": reference, "status": "PENDING", "created_at": now_iso(),
+            },
+            _deposit_ref_path(method, reference): dep_id,
+        })
+        return dep_id
 
 
 def get_deposit(dep_id: int):
-    return db.execute("SELECT * FROM deposits WHERE id=?", (dep_id,)).fetchone()
+    d = _ref(f"deposits/{dep_id}").get()
+    if not d:
+        return None
+    return {"processed_by": None, "processed_at": None, **d, "id": dep_id}
 
 
 def finalize_deposit(dep_id: int, admin_id: int, approve: bool) -> Optional[dict]:
     """Atomically approve/cancel a pending deposit exactly once. Returns None if already processed."""
-    with tx():
-        dep = db.execute("SELECT * FROM deposits WHERE id=?", (dep_id,)).fetchone()
+    with _lock:
+        dep = get_deposit(dep_id)
         if dep is None or dep["status"] != "PENDING":
             return None
-        new_status = "APPROVED" if approve else "CANCELLED"
-        cur = db.execute(
-            "UPDATE deposits SET status=?, processed_by=?, processed_at=? "
-            "WHERE id=? AND status='PENDING'",
-            (new_status, admin_id, now_iso(), dep_id),
-        )
-        if cur.rowcount != 1:
-            return None
+        updates = {
+            f"deposits/{dep_id}/status": "APPROVED" if approve else "CANCELLED",
+            f"deposits/{dep_id}/processed_by": admin_id,
+            f"deposits/{dep_id}/processed_at": now_iso(),
+        }
         new_balance = None
         if approve:
-            db.execute(
-                "INSERT OR IGNORE INTO users (user_id, username, full_name, balance, started, created_at) "
-                "VALUES (?, NULL, '', 0, 0, ?)",
-                (dep["user_id"], now_iso()),
-            )
-            db.execute(
-                "UPDATE users SET balance = balance + ? WHERE user_id=?",
-                (dep["amount"], dep["user_id"]),
-            )
-            new_balance = db.execute(
-                "SELECT balance FROM users WHERE user_id=?", (dep["user_id"],)
-            ).fetchone()["balance"]
+            user = _ref(f"users/{dep['user_id']}").get()
+            if user:
+                new_balance = int(user.get("balance", 0)) + dep["amount"]
+                updates[f"users/{dep['user_id']}/balance"] = new_balance
+            else:
+                new_balance = dep["amount"]
+                updates[f"users/{dep['user_id']}"] = {
+                    "user_id": dep["user_id"], "full_name": "", "balance": new_balance,
+                    "started": 0, "created_at": now_iso(),
+                }
+        else:
+            updates[_deposit_ref_path(dep["method"], dep["reference"])] = None  # reference can be reused
+        _update(updates)
         return {"user_id": dep["user_id"], "amount": dep["amount"], "balance": new_balance}
 
 
 def save_deposit_msg(dep_id: int, chat_id: int, message_id: int) -> None:
-    db.execute(
-        "INSERT INTO deposit_msgs (deposit_id, chat_id, message_id) VALUES (?, ?, ?)",
-        (dep_id, chat_id, message_id),
-    )
+    _ref(f"deposit_msgs/{dep_id}").push({"chat_id": chat_id, "message_id": message_id})
 
 
 def get_deposit_msgs(dep_id: int) -> list:
-    return db.execute(
-        "SELECT chat_id, message_id FROM deposit_msgs WHERE deposit_id=?", (dep_id,)
-    ).fetchall()
+    return [v for _, v in _items(_ref(f"deposit_msgs/{dep_id}").get())]
 
 
 # --------------------------------------------------------------------------- #
@@ -887,10 +932,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 @router.message(Command("retry"))
 async def cmd_retry(message: Message, bot: Bot):
-    rows = db.execute(
-        "SELECT id FROM orders WHERE user_id=? AND status='COMPLETED' AND delivered=0 ORDER BY id",
-        (message.from_user.id,),
-    ).fetchall()
+    rows = get_undelivered_orders(message.from_user.id)
     if not rows:
         await message.answer("✅ কোনো পেন্ডিং ডেলিভারি নেই।")
         return
@@ -1174,7 +1216,7 @@ async def deliver_order(bot: Bot, order_id: int) -> bool:
             await bot.send_document(
                 order["user_id"], BufferedInputFile(payload, filename=filename), caption=caption
             )
-            db.execute("UPDATE orders SET delivered=1 WHERE id=?", (order_id,))
+            mark_delivered(order_id)
             return True
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
@@ -1824,7 +1866,7 @@ async def admin_broadcast_message(message: Message, state: FSMContext, bot: Bot)
         await state.clear()
         return
     await state.clear()
-    user_ids = [r["user_id"] for r in db.execute("SELECT user_id FROM users WHERE started=1").fetchall()]
+    user_ids = get_started_user_ids()
     status = await message.answer(f"📢 ব্রডকাস্ট শুরু হয়েছে... ({len(user_ids)} জন)")
     ok = failed = 0
     for uid in user_ids:
@@ -1868,7 +1910,7 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN environment variable is not set.")
     init_db()
-    log.info("Database: %s | Admins: %s", DB_PATH, sorted(ADMIN_IDS))
+    log.info("Database: Firebase | Admins: %s", sorted(ADMIN_IDS))
     if SECOND_ADMIN_ID is None:
         log.warning("ADMIN_ID is not set - only the primary admin is active.")
 
