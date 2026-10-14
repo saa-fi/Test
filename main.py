@@ -1097,7 +1097,7 @@ def not_command(message: Message) -> bool:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    if fsub_enabled() and not await is_fsub_member(bot, message.from_user.id):
+    if fsub_enabled():
         await message.answer(FSUB_TEXT, reply_markup=await fsub_join_kb(bot))
         return
     await message.answer(WELCOME_TEXT, reply_markup=main_menu())
