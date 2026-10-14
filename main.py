@@ -73,6 +73,8 @@ ADMIN_IDS = {PRIMARY_ADMIN_ID} | ({SECOND_ADMIN_ID} if SECOND_ADMIN_ID else set(
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "").strip()  # service-account JSON (or path to it)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # Firebase Realtime Database URL
 
+FSUB_CHANNEL = os.getenv("FSUB_CHANNEL", "").strip().lstrip("@")  # force-sub channel username (no @); empty = feature off
+
 SUPPORT_URL = "https://t.me/team_passivpay_nexa"
 BKASH_NUMBER = "01533235544"
 NAGAD_NUMBER = "01533235544"
@@ -145,6 +147,11 @@ WELCOME_TEXT = (
     "🛒 পছন্দের প্রোডাক্ট বেছে নিন, মুহূর্তেই ডেলিভারি পান।\n"
     "👛 ওয়ালেটে ফান্ড যোগ করুন আর নিশ্চিন্তে কেনাকাটা করুন।\n\n"
     "⚡ Instant Delivery • 🔒 Secure • 🤝 24/7 Support"
+)
+
+FSUB_TEXT = (
+    "🔒 <b>বট ব্যবহার করতে হলে আগে আমাদের অফিসিয়াল চ্যানেলে Join করুন।</b>\n\n"
+    "👇 নিচে 'Join Now' চাপুন, Join করার পর 'Check Join' চাপুন।"
 )
 
 # --------------------------------------------------------------------------- #
@@ -238,6 +245,33 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 def cancel_flow_kb() -> InlineKeyboardMarkup:
     return ikb([ibtn("❌ 𝗖𝗮𝗻𝗰𝗲𝗹", "flowcancel", style="danger")])
+
+
+# --------------------------------------------------------------------------- #
+# Force-subscribe (join-channel-before-use)
+# --------------------------------------------------------------------------- #
+def fsub_enabled() -> bool:
+    return bool(FSUB_CHANNEL)
+
+
+def fsub_join_kb() -> InlineKeyboardMarkup:
+    return ikb(
+        [ibtn("📢 Join Now", url=f"https://t.me/{FSUB_CHANNEL}", style="primary")],
+        [ibtn("✅ Check Join", "fsub:check", style="success")],
+    )
+
+
+async def is_fsub_member(bot: Bot, user_id: int) -> bool:
+    """True if the user has joined FSUB_CHANNEL. Fails open (allows access) if the
+    channel isn't reachable — e.g. the bot isn't an admin there yet — so a
+    misconfiguration never locks everyone out of the bot."""
+    if not fsub_enabled():
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=f"@{FSUB_CHANNEL}", user_id=user_id)
+    except TelegramAPIError:
+        return True
+    return member.status in ("member", "administrator", "creator")
 
 
 # --------------------------------------------------------------------------- #
@@ -982,6 +1016,19 @@ class GateMiddleware(BaseMiddleware):
         data["is_new_user"] = upsert_user(user)
 
         if is_enabled():
+            if fsub_enabled() and not is_admin(user.id):
+                bypass = (
+                    (isinstance(event, CallbackQuery) and event.data == "fsub:check")
+                    or (isinstance(event, Message) and (event.text or "").startswith("/start"))
+                )
+                if not bypass:
+                    bot: Bot = data.get("bot")
+                    if not await is_fsub_member(bot, user.id):
+                        if isinstance(event, Message):
+                            await event.answer(FSUB_TEXT, reply_markup=fsub_join_kb())
+                        elif isinstance(event, CallbackQuery):
+                            await event.answer("🔒 প্রথমে চ্যানেলে Join করুন, তারপর আবার চেষ্টা করুন।", show_alert=True)
+                        return None
             return await handler(event, data)
 
         # ---- bot is disabled ----
@@ -1023,9 +1070,22 @@ def not_command(message: Message) -> bool:
 # Commands
 # --------------------------------------------------------------------------- #
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
+    if fsub_enabled() and not await is_fsub_member(bot, message.from_user.id):
+        await message.answer(FSUB_TEXT, reply_markup=fsub_join_kb())
+        return
     await message.answer(WELCOME_TEXT, reply_markup=main_menu())
+
+
+@router.callback_query(F.data == "fsub:check")
+async def cb_fsub_check(call: CallbackQuery, bot: Bot):
+    if fsub_enabled() and not await is_fsub_member(bot, call.from_user.id):
+        await call.answer("❌ আপনি এখনো চ্যানেলে Join করেননি। Join করে আবার চেক করুন।", show_alert=True)
+        return
+    await call.answer("✅ Join ভেরিফাইড হয়েছে!")
+    await safe_edit(call.message, "✅ Join ভেরিফাইড হয়েছে।")
+    await safe_send(bot, call.from_user.id, WELCOME_TEXT, reply_markup=main_menu())
 
 
 @router.message(Command("cancel"))
