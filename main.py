@@ -1187,6 +1187,72 @@ async def cmd_broadcast(message: Message, state: FSMContext):
 
 
 # --------------------------------------------------------------------------- #
+# Admin: /userlist (20 users per page, Previous / Next)
+# --------------------------------------------------------------------------- #
+USERLIST_PAGE_SIZE = 20
+
+
+def _userlist_page(page: int):
+    """Returns (text, total_pages, page) for the given page index."""
+    rows = []
+    for k, v in _items(_ref("users").get()):
+        if not isinstance(v, dict):
+            continue
+        rows.append(_user_row(int(v.get("user_id") or k), v))
+    rows.sort(key=lambda r: (str(r.get("created_at") or ""), r["user_id"]))
+    total = len(rows)
+    pages = max(1, (total + USERLIST_PAGE_SIZE - 1) // USERLIST_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * USERLIST_PAGE_SIZE
+    lines = [f"👥 <b>User List</b> — মোট {total} জন (Page {page + 1}/{pages})\n"]
+    for i, r in enumerate(rows[start:start + USERLIST_PAGE_SIZE], start + 1):
+        username = f"@{esc(r['username'])}" if r.get("username") else "Not set"
+        full_name = esc(r.get("full_name") or "-")
+        lines.append(
+            f"<b>{i}.</b> {username}\n"
+            f"   🙋 {full_name}\n"
+            f"   🆔 <code>{r['user_id']}</code> | 💎 {fmt_money(int(r.get('balance') or 0))} TK"
+        )
+    if total == 0:
+        lines.append("কোনো ইউজার নেই।")
+    return "\n".join(lines), pages, page
+
+
+def _userlist_kb(page: int) -> InlineKeyboardMarkup:
+    return ikb([
+        ibtn("⬅️ Previous", f"ulist:{page - 1}", style="primary"),
+        ibtn("Next ➡️", f"ulist:{page + 1}", style="primary"),
+    ])
+
+
+@router.message(Command("userlist"))
+async def cmd_userlist(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ আপনি অ্যাডমিন নন।")
+        return
+    await state.clear()
+    text, _pages, page = await asyncio.to_thread(_userlist_page, 0)
+    await message.answer(text, reply_markup=_userlist_kb(page))
+
+
+@router.callback_query(F.data.regexp(r"^ulist:-?\d+$"))
+async def cb_userlist(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔ আপনি অ্যাডমিন নন।", show_alert=True)
+        return
+    want = int(call.data.split(":", 1)[1])
+    text, pages, page = await asyncio.to_thread(_userlist_page, want)
+    if want < 0:
+        await call.answer("এটাই প্রথম পেজ।")
+        return
+    if want >= pages:
+        await call.answer("এটাই শেষ পেজ।")
+        return
+    await call.answer()
+    await safe_edit(call.message, text, _userlist_kb(page))
+
+
+# --------------------------------------------------------------------------- #
 # Main menu buttons
 # --------------------------------------------------------------------------- #
 @router.message(F.text == BTN_BUY)
