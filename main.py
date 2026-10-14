@@ -304,6 +304,15 @@ async def is_fsub_member(bot: Bot, user_id: int) -> bool:
     return member.status in ("member", "administrator", "creator")
 
 
+def fsub_is_verified(user_id: int) -> bool:
+    """True only after the user has pressed 'Check Join' and passed (stored in DB)."""
+    return str(_ref(f"users/{user_id}/fsub_ok").get()) == "1"
+
+
+def fsub_set_verified(user_id: int, flag: bool) -> None:
+    _ref(f"users/{user_id}/fsub_ok").set(1 if flag else 0)
+
+
 # --------------------------------------------------------------------------- #
 # Database (Firebase Realtime Database)
 # --------------------------------------------------------------------------- #
@@ -1053,7 +1062,11 @@ class GateMiddleware(BaseMiddleware):
                 )
                 if not bypass:
                     bot: Bot = data.get("bot")
-                    if not await is_fsub_member(bot, user.id):
+                    verified = fsub_is_verified(user.id)
+                    member = verified and await is_fsub_member(bot, user.id)
+                    if verified and not member:
+                        fsub_set_verified(user.id, False)  # left the channel -> must verify again
+                    if not (verified and member):
                         if isinstance(event, Message):
                             await event.answer(FSUB_TEXT, reply_markup=await fsub_join_kb(bot))
                         elif isinstance(event, CallbackQuery):
@@ -1113,6 +1126,7 @@ async def cb_fsub_check(call: CallbackQuery, bot: Bot):
     if fsub_enabled() and not await is_fsub_member(bot, call.from_user.id):
         await call.answer("❌ আপনি এখনো চ্যানেলে Join করেননি। Join করে আবার চেক করুন।", show_alert=True)
         return
+    fsub_set_verified(call.from_user.id, True)
     await call.answer("✅ Join ভেরিফাইড হয়েছে!")
     await safe_edit(call.message, "✅ Join ভেরিফাইড হয়েছে।")
     await safe_send(bot, call.from_user.id, WELCOME_TEXT, reply_markup=main_menu())
